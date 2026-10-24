@@ -12,6 +12,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Chaquopy 的 Python 运行时与预编译轮子默认从 chaquopy.com/python 下载，
+      # 但其 HTTPS 证书绑定的是 chaquo.com（证书主机名不匹配会导致严格 TLS 校验失败）。
+      # 改用证书匹配的 chaquo.com 主机即可。Maven 插件源同理已在 build.gradle 改为 chaquo.com/maven。
+      PYTHON_REPOSITORY: https://chaquo.com/python
     steps:
       - name: Checkout
         uses: actions/checkout@v4
