@@ -1,8 +1,8 @@
 name: Build MPT Android APK
 
 # 在 GitHub 免费 runner 上构建 APK（无需本机 Android Studio）。
-# runner 网络可正常访问 chaquopy.com，因此能拉取 Chaquopy 插件、Python 3.11 运行时与各轮子。
 # 用法：把本工程推到 GitHub 仓库后，Actions 页手动 Run workflow；产物在 Artifacts 下载。
+# 注意：推送 main 会自动触发构建（无需手动点按钮）。
 
 on:
   workflow_dispatch:
@@ -12,11 +12,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      # Chaquopy 的 Python 运行时与预编译轮子默认从 chaquopy.com/python 下载，
-      # 但其 HTTPS 证书绑定的是 chaquo.com（证书主机名不匹配会导致严格 TLS 校验失败）。
-      # 改用证书匹配的 chaquo.com 主机即可。Maven 插件源同理已在 build.gradle 改为 chaquo.com/maven。
-      PYTHON_REPOSITORY: https://chaquo.com/python
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -42,10 +42,10 @@ chaquopy {
         version "3.11"
 
         pip {
-            // imageio-ffmpeg 已不需要：我们用 assets 内置 ffmpeg 并通过
-            // IMAGEIO_FFMPEG_EXE 环境变量指定，get_ffmpeg_binary() 会优先用它，
-            // 不再 import imageio_ffmpeg。
-            options "--extra-index-url", "https://pypi.org/simple"
+            // imageio-ffmpeg 在 PyPI 只发布平台专用 wheel（无 py3-none-any / 无 Android 轮子），
+            // Chaquopy 为 aarch64 目标无法解析，故改为仓库内本地 wheel（已构建为通用 py3-none-any）。
+            // 运行时由 IMAGEIO_FFMPEG_EXE 指向 assets 内置 ffmpeg，不会调用其自带的下载逻辑。
+            install "vendor/imageio_ffmpeg-0.6.0-py3-none-any.whl"
             install "fastapi==0.136.3"
             install "uvicorn==0.32.1"
             install "starlette==1.2.1"
