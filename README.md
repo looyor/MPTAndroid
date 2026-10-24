@@ -27,27 +27,56 @@
 | GitHub 账号 | [github.com](https://github.com) 注册 | 免费 |
 | GitHub Desktop 软件 | [desktop.github.com](https://desktop.github.com) 下载安装 | 免费 |
 
-### 8 步出包（照着点就行）
+### 在 GitHub 上怎么操作（每一步点哪里都写清楚了）
 
-1. **下载工程**：在本页文件列表里下载 `MPTAndroid.zip`，解压到一个普通文件夹（比如桌面新建的 `MPTAndroid` 文件夹）。
-2. **注册/登录 GitHub**：打开 [github.com](https://github.com)，用邮箱注册一个账号并登录。
-3. **安装 GitHub Desktop**：打开 [desktop.github.com](https://desktop.github.com) 下载并安装，装好后用刚才的 GitHub 账号登录。
-4. **把工程交给 GitHub Desktop**：
-   - 打开 GitHub Desktop → 菜单 `File` → `Add Local Repository...`
-   - 选你刚解压的 `MPTAndroid` 文件夹 → 点 `Add Repository`。
-5. **一键发布到网上**：
-   - 点左上角蓝色的 **`Publish repository`**（发布仓库）。
-   - 名字随便填（如 `MPTAndroid`），**取消勾选** “Keep this code private”（必须先公开，Actions 才免费）。
-   - 点 `Publish Repository`，等几秒，代码就上传到你的 GitHub 了。
-6. **云端自动打包**：
-   - 用浏览器打开你的 GitHub 仓库页面 → 点上方 **`Actions`** 标签。
-   - 在左侧找到 **`Build MPT Android APK`** → 点进去 → 右侧 **`Run workflow`** → 再点一次绿色的 `Run workflow`。
-7. **等待**（大约 10–20 分钟，显示黄色转圈=进行中，绿色对勾=成功）。
-8. **下载 APK**：
-   - 跑完点进该次任务 → 底部 **`Artifacts`** → 下载 **`mpt-android-apk`**（这就是 `app-debug.apk`）。
-   - 把 APK 传到手机（微信文件/网盘/U 盘）→ 点开安装（首次需允许“未知来源”）。
+> 前提：电脑上已把 `MPTAndroid.zip` 解压，得到一个 `MPTAndroid` 文件夹。
+
+#### ① 注册 GitHub 账号（手机或电脑浏览器都行）
+1. 打开 [github.com](https://github.com)。
+2. 点右上角绿色的 **`Sign up`**。
+3. 填邮箱 → 设密码 → 取一个用户名 → 一路点 `Continue`。
+4. 去邮箱收验证邮件，点里面的确认链接完成注册。
+
+#### ② 电脑上装 GitHub Desktop 并登录
+1. 电脑打开 [desktop.github.com](https://desktop.github.com) → 点 `Download`。
+2. 双击安装，打开软件。
+3. 首次打开会让你登录 GitHub → 点 `Sign in` → 在网页里授权（Authorize）→ 回到软件即登录成功。
+
+#### ③ 把工程发布到 GitHub（最关键的一步）
+1. 打开 GitHub Desktop。
+2. 顶部菜单 `File` → `Add Local Repository...`。
+3. 点 `Choose...` → 选中你解压出来的 `MPTAndroid` 文件夹 → 点 `Add Repository`。
+   - 添加成功后会看到左侧出现这个仓库，下方有一堆文件列表。
+4. 点左上角的蓝色按钮 **`Publish repository`**（发布仓库）。
+5. 在弹出的窗口里：
+   - **Name**（仓库名）：填 `MPTAndroid`（随便填也行）。
+   - **Description**（描述）：可留空。
+   - ⚠️ **必须取消勾选** `Keep this code private`（一定要公开！否则 GitHub Actions 不能免费使用，就没法自动打包）。
+   - 点 **`Publish Repository`**。
+6. 等几秒，提示 `Publish complete` 就成功了——代码已经在你的 GitHub 上了。
+
+#### ④ 在 GitHub 网页启动自动打包
+1. 用浏览器打开 [github.com](https://github.com) → 登录 → 进入你刚建的仓库。
+2. 点仓库页面**上方一排标签里的 `Actions`**（在 Code / Issues / Pull requests 那一行）。
+3. 左侧列表点 **`Build MPT Android APK`**。
+4. 右侧点绿色的 **`Run workflow`** 按钮 → 弹出的小框里再点一次绿色的 **`Run workflow`**。
+5. 页面会出现一个黄色小圆点（● 进行中）。点进去能看到实时日志。
+   - 大约 10–20 分钟：变**绿色对勾 ✓ = 成功**；变**红色 ✕ = 失败**（把日志截图发我）。
+
+#### ⑤ 下载 APK 并装到手机
+1. 跑到绿色对勾后，点进那一次任务页面。
+2. 页面**最下方 `Artifacts` 区域** → 点 **`mpt-android-apk`** 下载（这是一个 zip）。
+3. 解压得到 `app-debug.apk`。
+4. 传到手机（微信文件传输 / 网盘 / U 盘）→ 点开安装（首次需允许“未知来源”）。
 
 > 装好打开 App，按第 5 节填大模型 API Key + Pexels Key，就能在手机上生成短视频了。
+
+#### 常见问题
+- **找不到 `Publish repository` 按钮？** 先确认第 ③ 步 `Add Local Repository` 成功、左侧已选中该仓库；按钮在窗口左上角，蓝色。
+- **`Actions` 标签点不开 / 显示不可用？** 仓库必须是 **public（公开）**。若误设为 private，进仓库 `Settings → Change visibility` 改为 public，或重新发布。
+- **一直卡在 `Set up job` / 黄色转圈很久？** 正常，首次要联网拉取 Gradle、Chaquopy、Python 3.11 和一堆依赖，耐心等 10–20 分钟。
+- **红色失败？** 多半是网络临时问题，点 `Re-run jobs` 重试一次；仍失败把日志发我。
+- **没有电脑、只有手机？** 借用他人电脑做第 ②③ 步（把代码传上 GitHub）即可，第 ④⑤ 步在手机浏览器里就能完成。
 
 ### （可选）如果你会用命令行
 在解压后的 `MPTAndroid` 文件夹里打开终端，依次执行（替换成你的 GitHub 用户名和仓库名）：
