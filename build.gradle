@@ -2,11 +2,10 @@ buildscript {
     repositories {
         google()
         mavenCentral()
-        maven { url "https://chaquo.com/maven" }
     }
     dependencies {
         classpath 'com.android.tools.build:gradle:8.5.2'
-        classpath 'com.chaquo.python:gradle:15.0.0'
+        classpath 'com.chaquo.python:gradle:17.1.0'
     }
 }
 
@@ -14,6 +13,5 @@ allprojects {
     repositories {
         google()
         mavenCentral()
-        maven { url "https://chaquo.com/maven" }
     }
 }

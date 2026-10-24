@@ -126,7 +126,7 @@ git push -u origin main
 
 | 项目 | 方案 | 说明 |
 |------|------|------|
-| Python 运行时 | Chaquopy 15.0.0 + Python 3.11 | 在 APK 内嵌解释器，无需 root |
+| Python 运行时 | Chaquopy 17.1.0 + Python 3.11 | 在 APK 内嵌解释器，无需 root |
 | 后端 | FastAPI（去掉 Streamlit） | 原 Streamlit WebUI 太重，改为自定义移动端 WebUI |
 | 字幕 | MoviePy 2.x + Pillow `TextClip` | 用 Pillow 渲染，无需交叉编译 ImageMagick |
 | 任务队列 | `InMemoryTaskManager` | `enable_redis=False`，无需 Redis 服务 |
@@ -146,7 +146,7 @@ git push -u origin main
    - 原实现用 `setattr(cfg_module, "openai_api_key", ...)` 写入模块属性——既不生效也不被 `save_config()` 持久化。
    - 改为写入 `config.app[...]` 字典分区（与 MPT 的 `config_key()` 读取路径一致），并调用 `cfg_module.save_config()`。
 3. **搭建完整 Android 工程**
-   - `build.gradle`：AGP 8.5.2 + Chaquopy 15.0.0；`app/build.gradle`：`python { version "3.11" }` + pip 依赖清单。
+   - `build.gradle`：AGP 8.5.2 + Chaquopy 17.1.0；`app/build.gradle`：`python { version "3.11" }` + pip 依赖清单。
    - `MainActivity.java`：释放 ffmpeg → 启动 Python → 轮询 8080 → 加载 WebView。
    - `AndroidManifest.xml` / `network_security_config.xml`：放行 127.0.0.1 / localhost 明文（WebView 访问本地 FastAPI）。
    - 移动端 WebUI：配置表单、AI 生成文案、生成视频、进度轮询、播放/下载。
@@ -167,7 +167,7 @@ git push -u origin main
 - 连锁影响：Chaquopy Gradle 插件、Python 3.11 运行时、以及 **Android 版 numpy / pillow 轮子**（仅由 Chaquopy 提供，PyPI 上无 Android aarch64 轮子）都无法下载。
 - 沙箱为 x86_64，也无法本地运行任何 aarch64 二进制做冒烟测试。
 
-> Chaquopy 真实最新版为 17.1.0（支持 Python 3.11+）；本工程用 15.0.0 + Python 3.11 即可。**这是网络可达性问题，在正常开发环境下不存在。**
+> Chaquopy 真实最新版为 17.1.0（支持 Python 3.11+）。本工程已改用 `mavenCentral()` 拉取插件（版本 17.1.0），并将 Python 运行时/轮子源指向证书匹配的 `chaquo.com/python`，规避了 `chaquopy.com` 证书主机名不匹配的问题。**在正常网络环境下可直接构建。**
 
 ---
 
@@ -246,7 +246,7 @@ GitHub runner 网络可正常访问 `chaquopy.com`，全自动拉取 Chaquopy �
 
 ```
 MPTAndroid/
-├── build.gradle                      # AGP 8.5.2 + Chaquopy 15.0.0 classpath
+├── build.gradle                      # AGP 8.5.2 + Chaquopy 17.1.0 classpath
 ├── settings.gradle
 ├── gradle.properties
 ├── local.properties.example           # 模板：复制为 local.properties 填 sdk.dir
