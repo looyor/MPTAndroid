@@ -37,30 +37,32 @@ android {
     }
 }
 
-python {
-    version "3.11"
+chaquopy {
+    defaultConfig {
+        version "3.11"
 
-    pip {
-        install "fastapi==0.136.3"
-        install "uvicorn==0.32.1"
-        install "starlette==1.2.1"
-        install "edge_tts==7.3.1"
-        install "openai==1.39.0"
-        install "google-genai==2.11.0"
-        install "dashscope==1.20.14"
-        install "moviepy==2.2.1"
-        install "imageio-ffmpeg==0.6.0"
-        install "toml==0.10.2"
-        install "loguru==0.7.3"
-        install "pyyaml==6.0.3"
-        install "requests==2.33.1"
-        install "pydub==0.25.1"
-        install "python-multipart==0.0.27"
-        install "packaging==24.2"
-        install "socksio==1.0.0"
-        install "redis==5.2.0"
-        install "numpy"
-        install "pillow"
+        pip {
+            install "fastapi==0.136.3"
+            install "uvicorn==0.32.1"
+            install "starlette==1.2.1"
+            install "edge_tts==7.3.1"
+            install "openai==1.39.0"
+            install "google-genai==2.11.0"
+            install "dashscope==1.20.14"
+            install "moviepy==2.2.1"
+            install "imageio-ffmpeg==0.6.0"
+            install "toml==0.10.2"
+            install "loguru==0.7.3"
+            install "pyyaml==6.0.3"
+            install "requests==2.33.1"
+            install "pydub==0.25.1"
+            install "python-multipart==0.0.27"
+            install "packaging==24.2"
+            install "socksio==1.0.0"
+            install "redis==5.2.0"
+            install "numpy"
+            install "pillow"
+        }
     }
 }
 
