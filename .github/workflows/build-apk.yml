@@ -1,0 +1,48 @@
+name: Build MPT Android APK
+
+# 在 GitHub 免费 runner 上构建 APK（无需本机 Android Studio）。
+# runner 网络可正常访问 chaquopy.com，因此能拉取 Chaquopy 插件、Python 3.11 运行时与各轮子。
+# 用法：把本工程推到 GitHub 仓库后，Actions 页手动 Run workflow；产物在 Artifacts 下载。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK (含 NDK 27)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platform-tools
+            build-tools;34.0.0
+            platforms;android-34
+            ndk;27.0.12077973
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Build debug APK (Gradle 8.9)
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: 8.9
+          arguments: assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpt-android-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

@@ -1,0 +1,9 @@
+# 复制本文件为 local.properties，并填好你的本机路径。
+# Android Studio 首次打开工程时会自动生成此文件，通常无需手动创建。
+
+# Android SDK 路径（必填，或用环境变量 ANDROID_HOME / ANDROID_SDK_ROOT）
+sdk.dir=/path/to/Android/Sdk
+
+# NDK 对当前工程是可选的：Chaquopy 直接提供预编译的 Android 轮子（numpy / pillow 等），
+# 不需要从源码编译。若已安装可填，不填也不影响构建。
+# ndk.dir=/path/to/Android/Sdk/ndk/27.0.12077973

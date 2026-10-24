@@ -1,0 +1,16 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/app/build/
+captures/
+*.log
+
+# Python caches
+__pycache__/
+*.py[cod]
+.Python
+*.egg-info/
+
