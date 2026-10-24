@@ -42,6 +42,10 @@ chaquopy {
         version "3.11"
 
         pip {
+            // imageio-ffmpeg 已不需要：我们用 assets 内置 ffmpeg 并通过
+            // IMAGEIO_FFMPEG_EXE 环境变量指定，get_ffmpeg_binary() 会优先用它，
+            // 不再 import imageio_ffmpeg。
+            options "--extra-index-url", "https://pypi.org/simple"
             install "fastapi==0.136.3"
             install "uvicorn==0.32.1"
             install "starlette==1.2.1"
@@ -50,7 +54,6 @@ chaquopy {
             install "google-genai==2.11.0"
             install "dashscope==1.20.14"
             install "moviepy==2.2.1"
-            install "imageio-ffmpeg==0.6.0"
             install "toml==0.10.2"
             install "loguru==0.7.3"
             install "pyyaml==6.0.3"
