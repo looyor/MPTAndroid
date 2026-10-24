@@ -39,6 +39,11 @@ jobs:
       - name: Accept Android SDK licenses
         run: yes | sdkmanager --licenses || true
 
+      - name: Set up Python 3.11 (供 Chaquopy buildPython 在构建机跑 pip)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Build debug APK (Gradle 8.9)
         uses: gradle/gradle-build-action@v3
         with:
