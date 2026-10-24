@@ -12,6 +12,59 @@
 - ⚠️ **当前沙箱网络环境无法完成最终 APK 打包**，原因见第 3 节——这是**网络环境限制，不是工程代码缺陷**。
 - ✅ 在**能正常访问 `chaquopy.com` 的网络环境**下（你的开发机 / CI），按第 4 节步骤即可一键构建出可安装的 `app-debug.apk`。
 - 工程位置：`/workspace/MPTAndroid`
+- 📦 **本工程已打包为可直接下载的压缩包**：`MPTAndroid.zip`（见本页顶部/文件列表）。
+
+---
+
+## 0.5 小白专用：零命令行出包（最简单，推荐先看这个）
+
+> 你只需要：**一台电脑（Windows 或 Mac，手机不行）** + **一个免费 GitHub 账号**。全程不用敲任何命令，用鼠标点几下就行。
+
+### 准备清单
+| 你需要 | 哪里拿 | 费用 |
+|--------|--------|------|
+| 工程压缩包 | 本页提供的 `MPTAndroid.zip` | 免费 |
+| GitHub 账号 | [github.com](https://github.com) 注册 | 免费 |
+| GitHub Desktop 软件 | [desktop.github.com](https://desktop.github.com) 下载安装 | 免费 |
+
+### 8 步出包（照着点就行）
+
+1. **下载工程**：在本页文件列表里下载 `MPTAndroid.zip`，解压到一个普通文件夹（比如桌面新建的 `MPTAndroid` 文件夹）。
+2. **注册/登录 GitHub**：打开 [github.com](https://github.com)，用邮箱注册一个账号并登录。
+3. **安装 GitHub Desktop**：打开 [desktop.github.com](https://desktop.github.com) 下载并安装，装好后用刚才的 GitHub 账号登录。
+4. **把工程交给 GitHub Desktop**：
+   - 打开 GitHub Desktop → 菜单 `File` → `Add Local Repository...`
+   - 选你刚解压的 `MPTAndroid` 文件夹 → 点 `Add Repository`。
+5. **一键发布到网上**：
+   - 点左上角蓝色的 **`Publish repository`**（发布仓库）。
+   - 名字随便填（如 `MPTAndroid`），**取消勾选** “Keep this code private”（必须先公开，Actions 才免费）。
+   - 点 `Publish Repository`，等几秒，代码就上传到你的 GitHub 了。
+6. **云端自动打包**：
+   - 用浏览器打开你的 GitHub 仓库页面 → 点上方 **`Actions`** 标签。
+   - 在左侧找到 **`Build MPT Android APK`** → 点进去 → 右侧 **`Run workflow`** → 再点一次绿色的 `Run workflow`。
+7. **等待**（大约 10–20 分钟，显示黄色转圈=进行中，绿色对勾=成功）。
+8. **下载 APK**：
+   - 跑完点进该次任务 → 底部 **`Artifacts`** → 下载 **`mpt-android-apk`**（这就是 `app-debug.apk`）。
+   - 把 APK 传到手机（微信文件/网盘/U 盘）→ 点开安装（首次需允许“未知来源”）。
+
+> 装好打开 App，按第 5 节填大模型 API Key + Pexels Key，就能在手机上生成短视频了。
+
+### （可选）如果你会用命令行
+在解压后的 `MPTAndroid` 文件夹里打开终端，依次执行（替换成你的 GitHub 用户名和仓库名）：
+
+```bash
+git init -q
+git add -A
+git commit -q -m "MPT Android"
+git remote add origin https://github.com/你的用户名/你的仓库名.git
+git branch -M main
+git push -u origin main
+```
+
+推上去后，从第 6 步（云端自动打包）继续即可。
+
+### 如果你只有手机、没有电脑
+本工程**必须在电脑或云端构建**（AIDE 等手机 IDE 无法构建，见第 4 节说明）。临时借用家人/朋友的电脑，或用手机浏览器登录 GitHub 网页版 + 旁边有电脑时操作即可——构建本身在 GitHub 云端完成，你只需要第 6–8 步在手机浏览器里点几下。
 
 ---
 
