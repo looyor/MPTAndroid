@@ -8,6 +8,9 @@ MoneyPrinterTurbo Android —— 轻量后端（无 FastAPI / 无 pydantic）
 无法在安卓编译的 Rust 扩展。
 
 由 bootstrap.start_server() 在后台线程中调用 run()。
+
+内置「模型市场」：12 家厂商、20+ 免费/低价模型。选模型时 Base URL 自动联动，
+并提供「测试是否可用」按钮，用你的 Key 实测该模型能否调通。
 """
 
 import json
@@ -44,15 +47,133 @@ ASSET_ROOT = None  # .../python/app/_assets/resource
 TASKS = {}          # task_id -> dict(state, progress, videos, error, logs)
 TASKS_LOCK = threading.Lock()
 
-# 各提供商的 OpenAI 兼容端点与默认模型
+# 各厂商的 OpenAI 兼容端点、模型与免费额度信息。
+# free=True 表示该模型/层级当前有免费额度或永久免费（免费额度用完/过期后可能转计费）。
 PROVIDERS = {
-    "openai":   ("https://api.openai.com/v1", "gpt-4o-mini"),
-    "deepseek": ("https://api.deepseek.com/v1", "deepseek-chat"),
-    "qwen":     ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
-    "moonshot": ("https://api.moonshot.cn/v1", "moonshot-v1-8k"),
-    "gemini":   ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-1.5-flash"),
-    "groq":     ("https://api.groq.com/openai/v1", "llama-3.1-8b-instant"),
+    "zhipu": {
+        "name": "智谱 GLM（国内·永久免费）",
+        "region": "国内",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "key_url": "https://open.bigmodel.cn/usercenter/apikeys",
+        "models": [
+            {"id": "glm-4.7-flash", "name": "GLM-4.7-Flash（永久免费）", "free": True},
+            {"id": "glm-4-flash", "name": "GLM-4-Flash（免费）", "free": True},
+            {"id": "glm-4-plus", "name": "GLM-4-Plus（强力·计费）", "free": False},
+        ],
+    },
+    "siliconflow": {
+        "name": "硅基流动 SiliconFlow（国内·免费开源）",
+        "region": "国内",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "key_url": "https://cloud.siliconflow.cn/account/ak",
+        "models": [
+            {"id": "deepseek-ai/DeepSeek-V3", "name": "DeepSeek-V3（免费额度）", "free": True},
+            {"id": "Qwen/Qwen2.5-7B-Instruct", "name": "Qwen2.5-7B（免费）", "free": True},
+            {"id": "Qwen/Qwen2.5-14B-Instruct", "name": "Qwen2.5-14B（免费额度）", "free": True},
+            {"id": "Pro/deepseek-ai/DeepSeek-R1", "name": "DeepSeek-R1（强力·计费）", "free": False},
+        ],
+    },
+    "deepseek": {
+        "name": "DeepSeek（国内·赠金）",
+        "region": "国内",
+        "base_url": "https://api.deepseek.com/v1",
+        "key_url": "https://platform.deepseek.com/api_keys",
+        "models": [
+            {"id": "deepseek-chat", "name": "DeepSeek-V3（deepseek-chat·赠金）", "free": True},
+            {"id": "deepseek-reasoner", "name": "DeepSeek-R1（deepseek-reasoner·赠金）", "free": False},
+        ],
+    },
+    "qwen": {
+        "name": "通义千问 Qwen（国内·阿里）",
+        "region": "国内",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "key_url": "https://dashscope.console.aliyun.com/apiKey",
+        "models": [
+            {"id": "qwen-turbo", "name": "Qwen-Turbo（便宜·免费额度）", "free": True},
+            {"id": "qwen-plus", "name": "Qwen-Plus（均衡·免费额度）", "free": True},
+            {"id": "qwen-max", "name": "Qwen-Max（最强·计费）", "free": False},
+        ],
+    },
+    "moonshot": {
+        "name": "Kimi / Moonshot（国内）",
+        "region": "国内",
+        "base_url": "https://api.moonshot.cn/v1",
+        "key_url": "https://platform.moonshot.cn/console/api-keys",
+        "models": [
+            {"id": "moonshot-v1-8k", "name": "Kimi 8K（免费额度）", "free": True},
+            {"id": "moonshot-v1-32k", "name": "Kimi 32K（免费额度）", "free": True},
+            {"id": "moonshot-v1-128k", "name": "Kimi 128K（长文本·免费额度）", "free": False},
+        ],
+    },
+    "gemini": {
+        "name": "Google Gemini（海外·免费层）",
+        "region": "海外",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "key_url": "https://aistudio.google.com/apikey",
+        "models": [
+            {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash（免费层）", "free": True},
+            {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash（免费层）", "free": True},
+        ],
+    },
+    "groq": {
+        "name": "Groq（海外·免费·极快）",
+        "region": "海外",
+        "base_url": "https://api.groq.com/openai/v1",
+        "key_url": "https://console.groq.com/keys",
+        "models": [
+            {"id": "llama-3.3-70b-versatile", "name": "Llama 3.3 70B（免费）", "free": True},
+            {"id": "llama-3.1-8b-instant", "name": "Llama 3.1 8B（免费·极速）", "free": True},
+        ],
+    },
+    "openrouter": {
+        "name": "OpenRouter（聚合·大量免费）",
+        "region": "海外",
+        "base_url": "https://openrouter.ai/api/v1",
+        "key_url": "https://openrouter.ai/keys",
+        "models": [
+            {"id": "deepseek/deepseek-chat-v3.1:free", "name": "DeepSeek V3.1 :free", "free": True},
+            {"id": "meta-llama/llama-3.3-70b-instruct:free", "name": "Llama 3.3 70B :free", "free": True},
+            {"id": "google/gemini-2.5-flash:free", "name": "Gemini 2.5 Flash :free", "free": True},
+        ],
+    },
+    "openai": {
+        "name": "OpenAI（海外·需绑卡）",
+        "region": "海外",
+        "base_url": "https://api.openai.com/v1",
+        "key_url": "https://platform.openai.com/api-keys",
+        "models": [
+            {"id": "gpt-4o-mini", "name": "GPT-4o mini（低价·需绑卡）", "free": False},
+        ],
+    },
+    "nvidia": {
+        "name": "NVIDIA NIM（海外·免费开源）",
+        "region": "海外",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "key_url": "https://build.nvidia.com/",
+        "models": [
+            {"id": "meta/llama-3.1-8b-instruct", "name": "Llama 3.1 8B（免费）", "free": True},
+            {"id": "deepseek-ai/deepseek-r1", "name": "DeepSeek-R1（免费）", "free": True},
+        ],
+    },
+    "mistral": {
+        "name": "Mistral AI（海外·免费额度）",
+        "region": "海外",
+        "base_url": "https://api.mistral.ai/v1",
+        "key_url": "https://console.mistral.ai/",
+        "models": [
+            {"id": "mistral-small-latest", "name": "Mistral Small（免费额度）", "free": True},
+        ],
+    },
 }
+
+
+def providers_payload():
+    out = []
+    for k, v in PROVIDERS.items():
+        item = dict(v)
+        item["key"] = k
+        out.append(item)
+    return out
 
 
 def log(task_id, msg):
@@ -67,7 +188,7 @@ def log(task_id, msg):
 
 def load_config():
     cfg = {
-        "provider": "openai",
+        "provider": "zhipu",
         "api_key": "",
         "base_url": "",
         "model_name": "",
@@ -112,13 +233,15 @@ def run_ffmpeg(args, task_id=None, timeout=600):
 # 大模型
 # --------------------------------------------------------------------------- #
 def llm_base_model(provider, cfg):
-    base, model = PROVIDERS.get(provider, PROVIDERS["openai"])
+    p = PROVIDERS.get(provider, PROVIDERS["openai"])
+    base = p["base_url"]
+    default_model = p["models"][0]["id"]
     base = (cfg.get("base_url") or "").strip() or base
-    model = (cfg.get("model_name") or "").strip() or model
+    model = (cfg.get("model_name") or "").strip() or default_model
     return base.rstrip("/"), model
 
 
-def chat_complete(provider, cfg, messages, temperature=0.8):
+def chat_complete(provider, cfg, messages, temperature=0.8, timeout=120):
     base, model = llm_base_model(provider, cfg)
     api_key = (cfg.get("api_key") or "").strip()
     url = base + "/chat/completions"
@@ -126,7 +249,7 @@ def chat_complete(provider, cfg, messages, temperature=0.8):
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = "Bearer " + api_key
-    r = requests.post(url, json=payload, headers=headers, timeout=120)
+    r = requests.post(url, json=payload, headers=headers, timeout=timeout)
     r.raise_for_status()
     data = r.json()
     return data["choices"][0]["message"]["content"].strip()
@@ -455,6 +578,7 @@ UI_HTML = r"""<!DOCTYPE html>
           padding:11px 14px;font-size:14px;font-weight:600;cursor:pointer}
   button.sec{background:var(--accent2)}
   button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+  button.sm{padding:6px 12px;font-size:12px;font-weight:600}
   button:active{opacity:.85}
   .hint{font-size:11px;color:var(--muted);margin-top:6px}
   .log{background:#0d0f13;border:1px solid var(--border);border-radius:10px;
@@ -462,10 +586,15 @@ UI_HTML = r"""<!DOCTYPE html>
        max-height:200px;overflow:auto;margin-top:10px}
   .badge{font-size:11px;padding:2px 8px;border-radius:20px;background:#222;border:1px solid var(--border)}
   .badge.run{color:var(--warn)} .badge.done{color:var(--ok)} .badge.err{color:var(--err)}
+  .badge.warn{color:var(--warn)}
   video{width:100%;border-radius:10px;background:#000;margin-top:8px}
-  a.dl{display:inline-block;margin-top:8px;color:var(--accent2);text-decoration:none;
-       font-size:13px;font-weight:600}
+  a.dl{display:inline-block;margin-top:4px;color:var(--accent2);text-decoration:none;
+       font-size:12px;font-weight:600;word-break:break-all}
   .toggle{float:right;color:var(--muted);font-size:12px;cursor:pointer}
+  .mkt-group{margin-top:10px;border-top:1px solid var(--border);padding-top:10px}
+  .mkt-title{font-size:13px;color:#fff;font-weight:600;margin-bottom:6px}
+  .mkt-item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed #222}
+  .mname{flex:1;font-size:13px;color:var(--text);word-break:break-all}
 </style>
 </head>
 <body>
@@ -474,30 +603,34 @@ UI_HTML = r"""<!DOCTYPE html>
   <div class="sub">输入主题 → AI 生成文案 → 配音 + 字幕 → 输出短视频（单 APK，本地运行）</div>
 
   <div class="card" id="cfgCard">
-    <h2>① 配置 <span class="toggle" onclick="toggleCfg()">展开/收起</span></h2>
+    <h2>① 配置大模型 <span class="toggle" onclick="toggleCfg()">展开/收起</span></h2>
     <div class="body" style="display:none">
       <label>大模型提供商</label>
-      <select id="provider">
-        <option value="openai">OpenAI</option>
-        <option value="deepseek">DeepSeek</option>
-        <option value="qwen">通义千问 (DashScope)</option>
-        <option value="moonshot">Kimi / Moonshot</option>
-        <option value="gemini">Google Gemini</option>
-        <option value="groq">Groq</option>
-      </select>
+      <select id="provider" onchange="onProviderChange()"></select>
+      <div class="hint" id="keyHint"></div>
       <label>API Key</label>
-      <input id="apiKey" type="text" placeholder="sk-...">
-      <label>Base URL（可选，留空用默认）</label>
-      <input id="baseUrl" type="text" placeholder="https://api.openai.com/v1">
-      <label>模型名（可选，留空用默认）</label>
-      <input id="modelName" type="text" placeholder="gpt-4o-mini">
-      <button class="sec" onclick="saveConfig()">保存配置</button>
-      <div class="hint">只需一个大模型 Key 即可使用（文案+配音在手机本地完成，不需要 Pexels）。保存后下方即可生成。</div>
+      <input id="apiKey" type="text" placeholder="sk-...（点上方链接去官网领取）">
+      <label>Base URL（选模型自动填，可改）</label>
+      <input id="baseUrl" type="text">
+      <label>模型</label>
+      <select id="modelName"></select>
+      <div class="row">
+        <button class="sec" onclick="saveConfig()">保存配置</button>
+        <button class="ghost" onclick="testModel()">🔌 测试是否可用</button>
+      </div>
+      <div id="testResult" class="hint"></div>
+      <div class="hint">只需一个大模型 Key。选好模型后 Base URL 会自动填好；点「测试」用你的 Key 实测能否调通。</div>
     </div>
   </div>
 
   <div class="card">
-    <h2>② 生成</h2>
+    <h2>② 免费模型市场 <span class="badge done">一键选用</span></h2>
+    <div class="sub">绿标 = 免费/免费额度；点「选用」自动填好接口地址与模型名，再去官网领 Key 即可。免费额度用完/过期可能转计费，可用「测试」按钮实测。</div>
+    <div id="market"></div>
+  </div>
+
+  <div class="card">
+    <h2>③ 生成</h2>
     <label>视频主题 / 关键词</label>
     <input id="subject" type="text" placeholder="例如：春天的花海，治愈系短视频">
     <button class="ghost" onclick="genScript()">AI 生成文案</button>
@@ -525,7 +658,7 @@ UI_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>③ 状态 <span id="stateBadge" class="badge"></span></h2>
+    <h2>④ 状态 <span id="stateBadge" class="badge"></span></h2>
     <div id="progressBox" style="display:none">
       <div id="progressText" class="hint">进度：0%</div>
     </div>
@@ -536,8 +669,69 @@ UI_HTML = r"""<!DOCTYPE html>
 
 <script>
 const API="";
+let PROVIDER_MAP={};
 function log(m){const e=document.getElementById('log');e.textContent+=m+"\n";e.scrollTop=e.scrollHeight;}
 function toggleCfg(){const b=document.querySelector('#cfgCard .body');b.style.display=b.style.display==='none'?'block':'none';}
+function setBadge(text,cls){const b=document.getElementById('stateBadge');b.className='badge '+(cls||'');b.textContent=text;}
+
+async function loadProviders(){
+  try{
+    const r=await fetch(API+"/api/v1/providers");
+    const j=await r.json();
+    const providers=(j.data&&j.data.providers)||[];
+    const sel=document.getElementById('provider');
+    sel.innerHTML='';
+    for(const p of providers){
+      PROVIDER_MAP[p.key]=p;
+      const o=document.createElement('option');
+      o.value=p.key; o.textContent=p.name;
+      sel.appendChild(o);
+    }
+    onProviderChange();
+    renderMarket(providers);
+  }catch(e){console.error(e);}
+}
+
+function onProviderChange(){
+  const key=document.getElementById('provider').value;
+  const p=PROVIDER_MAP[key];
+  if(!p) return;
+  document.getElementById('baseUrl').value=p.base_url;
+  const msel=document.getElementById('modelName');
+  msel.innerHTML='';
+  for(const m of p.models){
+    const o=document.createElement('option');
+    o.value=m.id;
+    o.textContent=(m.free?'[免费] ':'[计费] ')+m.name;
+    msel.appendChild(o);
+  }
+  document.getElementById('keyHint').innerHTML='官网领 Key：<a class="dl" href="'+p.key_url+'" target="_blank">'+p.key_url+'</a>（'+p.region+'）';
+}
+
+function renderMarket(providers){
+  const box=document.getElementById('market');
+  let html='';
+  for(const p of providers){
+    html+='<div class="mkt-group"><div class="mkt-title">'+p.name+' <span class="badge">'+p.region+'</span> <a class="dl" href="'+p.key_url+'" target="_blank">领 Key ↗</a></div>';
+    for(const m of p.models){
+      const free=m.free?'<span class="badge done">免费</span>':'<span class="badge warn">计费</span>';
+      html+='<div class="mkt-item">'+free+'<span class="mname">'+m.name+'</span><button class="ghost sm" onclick="useModel(\''+p.key+'\',\''+m.id+'\')">选用</button></div>';
+    }
+    html+='</div>';
+  }
+  box.innerHTML=html;
+}
+
+function useModel(pkey,mid){
+  const sel=document.getElementById('provider');
+  if(sel.querySelector('option[value="'+pkey+'"]')) sel.value=pkey;
+  onProviderChange();
+  const msel=document.getElementById('modelName');
+  if(msel.querySelector('option[value="'+mid+'"]')) msel.value=mid;
+  document.querySelector('#cfgCard .body').style.display='block';
+  window.scrollTo({top:0,behavior:'smooth'});
+  alert('已填入：'+pkey+' / '+mid+'。Base URL 已自动填好，去上方链接领 Key 后点「保存配置」即可。');
+}
 
 async function saveConfig(){
   const body={
@@ -552,6 +746,24 @@ async function saveConfig(){
     if(j && j.status===200) alert('配置已保存 ✅');
     else alert('保存失败：'+(j.message||'未知错误'));
   }catch(e){alert('请求失败：'+e.message);}
+}
+
+async function testModel(){
+  const res=document.getElementById('testResult');
+  const body={
+    provider:document.getElementById('provider').value,
+    api_key:document.getElementById('apiKey').value.trim(),
+    base_url:document.getElementById('baseUrl').value.trim(),
+    model_name:document.getElementById('modelName').value.trim()
+  };
+  if(!body.api_key){res.textContent='请先填写 API Key 再测试。';return;}
+  res.textContent='正在测试连接（约几秒）...';
+  try{
+    const r=await fetch(API+"/api/v1/test",{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(j.data && j.data.ok){res.innerHTML='✅ 可用！模型返回：'+(j.data.reply||'');}
+    else{res.innerHTML='❌ 不可用：'+((j.data&&j.data.error)||j.message||'未知错误');}
+  }catch(e){res.textContent='请求失败：'+e.message;}
 }
 
 async function genScript(){
@@ -599,8 +811,6 @@ async function genVideo(){
   }catch(e){log('错误：'+e.message);alert('请求失败：'+e.message);}
 }
 
-function setBadge(text,cls){const b=document.getElementById('stateBadge');b.className='badge '+(cls||'');b.textContent=text;}
-
 async function pollTask(taskId){
   if(pollTimer) clearInterval(pollTimer);
   pollTimer=setInterval(async ()=>{
@@ -630,6 +840,7 @@ function showResult(videos){
   box.innerHTML=html;
 }
 
+window.addEventListener('DOMContentLoaded', loadProviders);
 log('界面已加载，请先完成「配置」再生成。');
 </script>
 </body>
@@ -680,9 +891,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        elif path == "/api/v1/providers":
+            self._send_json({"status": 200, "data": {"providers": providers_payload()}})
         elif path.startswith("/api/v1/tasks/"):
             self._handle_task_get(path.split("/")[-1])
-
         elif path.startswith("/tasks/"):
             rel = path[len("/tasks/"):]
             fpath = os.path.normpath(os.path.join(MPT_HOME, "tasks", rel))
@@ -706,7 +918,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/v1/mpt_config":
             cfg = load_config()
-            cfg["provider"] = (body.get("provider") or cfg["provider"] or "openai").lower()
+            cfg["provider"] = (body.get("provider") or cfg["provider"] or "zhipu").lower()
             cfg["api_key"] = (body.get("api_key") or "").strip()
             cfg["base_url"] = (body.get("base_url") or "").strip()
             cfg["model_name"] = (body.get("model_name") or "").strip()
@@ -749,6 +961,25 @@ class Handler(BaseHTTPRequestHandler):
             aspect = (body.get("video_aspect") or "9:16")
             task_id = create_task(script, voice, aspect, cfg)
             self._send_json({"status": 200, "data": {"task_id": task_id}})
+
+        elif path == "/api/v1/test":
+            cfg = {
+                "provider": (body.get("provider") or "openai").lower(),
+                "api_key": (body.get("api_key") or "").strip(),
+                "base_url": (body.get("base_url") or "").strip(),
+                "model_name": (body.get("model_name") or "").strip(),
+            }
+            if not cfg["api_key"]:
+                self._send_json({"status": 400, "message": "请先填写 API Key"}, 400)
+                return
+            try:
+                text = chat_complete(cfg["provider"], cfg, [
+                    {"role": "system", "content": "你是测试助手，只回复两个字。"},
+                    {"role": "user", "content": "请回复：可用"},
+                ], temperature=0.3, timeout=30)
+                self._send_json({"status": 200, "data": {"ok": True, "reply": text[:60]}})
+            except Exception as e:
+                self._send_json({"status": 200, "data": {"ok": False, "error": str(e)[:300]}})
 
         elif path.startswith("/api/v1/tasks/"):
             self._handle_task_get(path.split("/")[-1])
