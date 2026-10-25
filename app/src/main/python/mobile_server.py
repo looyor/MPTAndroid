@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 import requests
+import shutil
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -43,6 +44,7 @@ MPT_HOME = None
 FFMPEG_PATH = None
 CONFIG_PATH = None
 ASSET_ROOT = None  # .../python/app/_assets/resource
+DOWNLOAD_DIR = None  # 手机 Download/Ai视频 导出目录（由 Java 侧传入）
 
 TASKS = {}          # task_id -> dict(state, progress, videos, error, logs)
 TASKS_LOCK = threading.Lock()
@@ -496,11 +498,40 @@ def build_video(task_id, script, voice, aspect, cfg):
     except Exception as e:
         log(task_id, "背景音乐叠加跳过：%s" % e)
 
+    # 导出到手机 Download/Ai视频（含视频与文案）
+    saved = export_to_downloads(task_id, final_path, script)
+
     with TASKS_LOCK:
         TASKS[task_id]["progress"] = 100
         TASKS[task_id]["state"] = 1
         TASKS[task_id]["videos"] = ["/tasks/%s/%s" % (task_id, os.path.basename(final_path))]
+        if saved:
+            TASKS[task_id]["download_path"] = saved
     log(task_id, "视频生成完成 ✅ %s" % final_path)
+
+
+def export_to_downloads(task_id, video_path, script):
+    """把成片(mp4)与文案(txt)复制到手机 Download/Ai视频。\n    返回目标 mp4 路径；未配置目录或失败时返回 None。\n    """
+    if not DOWNLOAD_DIR:
+        log(task_id, "未配置导出目录（Download/Ai视频），视频仅在应用内可播放。")
+        return None
+    try:
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        base = "MPT视频_%s" % ts
+        dst_mp4 = os.path.join(DOWNLOAD_DIR, base + ".mp4")
+        shutil.copyfile(video_path, dst_mp4)
+        dst_txt = os.path.join(DOWNLOAD_DIR, base + ".txt")
+        try:
+            with open(dst_txt, "w", encoding="utf-8") as f:
+                f.write(script or "")
+        except Exception as e:
+            log(task_id, "文案导出跳过：%s" % e)
+        log(task_id, "已导出到手机：Download/Ai视频/%s.mp4" % base)
+        return dst_mp4
+    except Exception as e:
+        log(task_id, "导出到 Download/Ai视频 失败（请检查存储权限）：%s" % e)
+        return None
 
 
 def pick_background_music():
@@ -822,13 +853,13 @@ async function pollTask(taskId){
       if(Array.isArray(d.logs)){ for(const l of d.logs){ if(!document.getElementById('log').textContent.includes(l)) log(l); } }
       document.getElementById('progressText').textContent='进度：'+prog+'%';
       if(state===-1){clearInterval(pollTimer);setBadge('失败','err');log('任务失败：'+(d.error||'未知'));alert('生成失败：'+(d.error||''));}
-      else if(state===1){clearInterval(pollTimer);setBadge('完成','done');showResult(d.videos||[]);log('视频生成完成 ✅');}
+      else if(state===1){clearInterval(pollTimer);setBadge('完成','done');showResult(d.videos||[], d.download_path);log('视频生成完成 ✅');}
       else{setBadge('进行中','run');}
     }catch(e){/* ignore transient */}
   },2000);
 }
 
-function showResult(videos){
+function showResult(videos, downloadPath){
   const box=document.getElementById('result');
   if(!videos.length){box.innerHTML='<div class="hint">未返回视频文件。</div>';return;}
   let html='';
@@ -837,6 +868,11 @@ function showResult(videos){
     html+='<video controls src="'+url+'"></video>'+
           '<a class="dl" href="'+url+'" download>⬇ 下载视频</a><br>';
   });
+  if(downloadPath){
+    html+='<div class="hint" style="margin-top:8px;color:var(--ok)">✅ 已保存到手机：Download/Ai视频/'+downloadPath.split('/').pop()+'<br><span style="color:var(--muted)">（用手机「文件管理」App 即可找到）</span></div>';
+  }else{
+    html+='<div class="hint" style="margin-top:8px;color:var(--warn)">未导出到 Download（可能未授予存储权限）。可在应用内下载，或到系统设置开启「所有文件访问」后重生成。</div>';
+  }
   box.innerHTML=html;
 }
 

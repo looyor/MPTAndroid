@@ -19,7 +19,7 @@ MPT_HOME = None
 FFMPEG_PATH = None
 
 
-def start_server(mpt_home, ffmpeg_path):
+def start_server(mpt_home, ffmpeg_path, download_dir=None):
     global MPT_HOME, FFMPEG_PATH
     MPT_HOME = mpt_home
     FFMPEG_PATH = ffmpeg_path
@@ -38,6 +38,7 @@ def start_server(mpt_home, ffmpeg_path):
     # 资源目录：python 源码根下的 app/_assets/resource
     here = os.path.dirname(os.path.abspath(__file__))
     mobile_server.ASSET_ROOT = os.path.join(here, "app", "_assets", "resource")
+    mobile_server.DOWNLOAD_DIR = download_dir
 
     if mobile_server.Image is None:
         print("WARNING: PIL 未就绪，字幕渲染将不可用：%s" % mobile_server._PIL_ERROR, flush=True)

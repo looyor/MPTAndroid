@@ -1,12 +1,20 @@
 package com.mpt.android;
 
+import android.Manifest;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.Settings;
 import android.webkit.WebChromeClient;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
 
 import com.chaquo.python.Python;
 import com.chaquo.python.android.AndroidPlatform;
@@ -33,6 +41,9 @@ public class MainActivity extends AppCompatActivity {
         webView.getSettings().setMediaPlaybackRequiresUserGesture(false);
         webView.setWebViewClient(new WebViewClient());
         webView.setWebChromeClient(new WebChromeClient());
+
+        // 0) 申请存储权限（导出视频到 Download/Ai视频 需要）
+        ensureStoragePermission();
 
         // 1) Extract the bundled ffmpeg binary to a writable location.
         extractFfmpeg();
@@ -99,13 +110,19 @@ public class MainActivity extends AppCompatActivity {
         mptHome.mkdirs();
         File ffmpeg = new File(getFilesDir(), "ffmpeg");
 
+        // 导出目录：手机「下载 / Download」下的 Ai视频 文件夹
+        File downloadDir = new File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "Ai视频");
+
         Thread serverThread = new Thread(() -> {
             try {
                 Python py = Python.getInstance();
                 py.getModule("bootstrap").callAttr(
                         "start_server",
                         mptHome.getAbsolutePath(),
-                        ffmpeg.getAbsolutePath()
+                        ffmpeg.getAbsolutePath(),
+                        downloadDir.getAbsolutePath()
                 );
             } catch (Exception e) {
                 e.printStackTrace();
@@ -113,6 +130,38 @@ public class MainActivity extends AppCompatActivity {
         });
         serverThread.setDaemon(true);
         serverThread.start();
+    }
+
+    /**
+     * 确保应用有权把视频写入 Download/Ai视频。
+     * - Android 11+：引导用户开启「所有文件访问」权限（MANAGE_EXTERNAL_STORAGE）。
+     * - Android 6~10：请求 READ/WRITE_EXTERNAL_STORAGE。
+     */
+    private void ensureStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                try {
+                    Intent intent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                    Toast.makeText(this,
+                            "请开启「允许访问所有文件」，视频才能保存到 Download/Ai视频",
+                            Toast.LENGTH_LONG).show();
+                } catch (Exception e) {
+                    Toast.makeText(this,
+                            "请在系统设置中授予「所有文件访问」权限", Toast.LENGTH_LONG).show();
+                }
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                        new String[]{
+                                Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                                Manifest.permission.READ_EXTERNAL_STORAGE
+                        }, 1001);
+            }
+        }
     }
 
     @Override
