@@ -10,7 +10,7 @@
 - ✅ 移植工程已**完整搭建且逻辑闭环**：Android 原生壳 + Chaquopy 内嵌 Python 3.11 + **轻量标准库后端** + WebView 移动端 UI + 内置 ffmpeg。
 - ✅ **ffmpeg 已交叉编译**为 ARM64 静态二进制（22.5MB），已打包进 `app/src/main/assets/ffmpeg/ffmpeg`。
 - ✅ **后端已重写为"轻量版"**：去掉了 FastAPI / uvicorn / pydantic / moviepy 等**无法在安卓安装的依赖**，只保留 `requests / gtts / pillow` 三个纯 Python 包，视频合成直接用内置 ffmpeg。彻底解决了之前 `pydantic-core` 无安卓轮子导致构建卡死的问题。
-- ✅ **使用极简**：手机上只需填**一个大模型 API Key**（OpenAI / DeepSeek / 通义千问 / Kimi / Gemini / Groq 任一），无需 Pexels、无需 Redis。
+- ✅ **使用极简**：内置**「免费模型市场」**（11 家厂商 / 26 模型，20 个免费），手机上只需领一个 Key、点「选用」自动填好接口地址，无需 Pexels、无需 Redis。
 - ⚠️ 本工程**必须在电脑或 GitHub 云端构建**（手机端 AIDE 无法构建，见第 4 节）；但**出包后 APK 是单个文件，可直接装到手机离线运行**。
 - 工程位置：`/workspace/MPTAndroid`
 
@@ -220,10 +220,12 @@ GitHub runner 网络可正常访问 `chaquopy.com`，全自动拉取 Chaquopy �
 ## 5. 运行与使用
 
 1. **首次启动**：应用释放 ffmpeg → 启动内嵌 Python 服务 → 轮询 `127.0.0.1:8080` → WebView 加载移动端 UI（约数秒）。
-2. **配置（①）**：
-   - 选择大模型厂商并填 **API Key**：OpenAI / DeepSeek / 通义千问(Qwen) / Kimi(Moonshot) / Gemini / Groq（**只需一个**）。
-   - 可选填 Base URL / 模型名（留空用各厂商默认）。
-   - 点「保存配置」。
+2. **配置（①）—— 已内置「免费模型市场」**：
+   - 打开 App 首页即可看到 **② 免费模型市场**：覆盖 11 家厂商、26 个模型（20 个免费/免费额度），如智谱 GLM-4.7-Flash（永久免费）、硅基流动、DeepSeek、通义千问、Kimi、Gemini、Groq、OpenRouter 等。
+   - 在「免费模型市场」点 **「选用」**，会自动填好该模型的 **Base URL + 模型名**，并展开配置卡；再点每组标题旁的「领 Key ↗」去对应官网（手机号/邮箱即可注册）领取 API Key。
+   - 选好模型后 **Base URL 也会随模型自动联动**（无需手填链接）；也可手动改。
+   - 填好 API Key 后，先点 **「🔌 测试是否可用」**——App 会用你的 Key 实测该模型能否调通（免费额度是否还有效），成功再点「保存配置」。
+   - 默认已选 **智谱 GLM**（国内永久免费，新手最省心）。
 3. **生成（②）**：
    - 填视频主题 → 「AI 生成文案」（或手动粘贴文案）。
    - 选配音语言（中文 / English / 日本語）与画面比例（9:16 / 16:9 / 1:1）。
