@@ -9,8 +9,8 @@ android {
         applicationId 'com.mpt.android'
         minSdk 24
         targetSdk 34
-        versionCode 2
-        versionName '1.3.9'
+        versionCode 3
+        versionName '1.4.0'
 
         ndk {
             abiFilters 'arm64-v8a'
@@ -34,6 +34,18 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 关键：让 jniLibs 里的 libffmpeg.so 在安装时被释放到 nativeLibraryDir
+    // （可执行目录）。Android 10+ 禁止执行应用私有数据目录里的二进制，
+    // 只有 nativeLibraryDir 里的 .so 才能被 exec，否则 ffmpeg 会报
+    // [Errno 13] Permission denied。
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            // 不要把 libffmpeg.so 当普通 .so 去 strip/改坏，原样保留可执行文件。
+            keepDebugSymbols.add("**/libffmpeg.so")
+        }
     }
 }
 

@@ -28,6 +28,7 @@ public class MainActivity extends AppCompatActivity {
 
     private static final int PORT = 8080;
     private WebView webView;
+    private File ffmpegBin;
 
     private static final String LOADING_HTML =
             "<!doctype html><html><head><meta charset='utf-8'>"
@@ -74,8 +75,8 @@ public class MainActivity extends AppCompatActivity {
         // 0) 申请存储权限（导出视频到 Download/Ai视频 需要）
         ensureStoragePermission();
 
-        // 1) Extract the bundled ffmpeg binary to a writable location.
-        extractFfmpeg();
+        // 1) 解析可执行的 ffmpeg（安装时释放到 nativeLibraryDir 的 libffmpeg.so）。
+        ffmpegBin = resolveFfmpeg();
 
         // 2) Start the embedded Python (FastAPI) server in a background thread.
         startPythonServer();
@@ -109,26 +110,25 @@ public class MainActivity extends AppCompatActivity {
         }).start();
     }
 
-    private void extractFfmpeg() {
+    /**
+     * 返回可执行的 ffmpeg 路径。
+     * 关键：Android 10+ 禁止执行应用私有可写目录（/data/user/0/.../files）里的
+     * 二进制，会报 [Errno 13] Permission denied。只有安装时由系统释放到
+     * nativeLibraryDir 的 libffmpeg.so 才具有可执行权限，因此这里优先用它。
+     * 老系统（Android 9 及以下）退回 files 目录解压的老路径作兜底。
+     */
+    private File resolveFfmpeg() {
         try {
-            File out = new File(getFilesDir(), "ffmpeg");
-            // Re-extract if missing or suspiciously small.
-            if (!out.exists() || out.length() < 5_000_000L) {
-                InputStream in = getAssets().open("ffmpeg/ffmpeg");
-                OutputStream os = new FileOutputStream(out);
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = in.read(buf)) > 0) {
-                    os.write(buf, 0, n);
-                }
-                in.close();
-                os.close();
+            File lib = new File(getApplicationInfo().nativeLibraryDir, "libffmpeg.so");
+            if (lib.exists()) {
                 //noinspection ResultOfMethodCallIgnored
-                out.setExecutable(true, false);
+                lib.setExecutable(true, false);
+                return lib;
             }
         } catch (Exception e) {
             e.printStackTrace();
         }
+        return new File(getFilesDir(), "ffmpeg");
     }
 
     private void startPythonServer() {
@@ -138,7 +138,7 @@ public class MainActivity extends AppCompatActivity {
         File mptHome = new File(getFilesDir(), "mpt");
         //noinspection ResultOfMethodCallIgnored
         mptHome.mkdirs();
-        File ffmpeg = new File(getFilesDir(), "ffmpeg");
+        File ffmpeg = (ffmpegBin != null) ? ffmpegBin : resolveFfmpeg();
 
         // 导出目录：手机「下载 / Download」下的 Ai视频 文件夹
         File downloadDir = new File(

@@ -166,7 +166,24 @@ PROVIDERS = {
             {"id": "mistral-small-latest", "name": "Mistral Small（免费额度）", "free": True},
         ],
     },
+    "local": {
+        "name": "本地大模型 / 自定义（Ollama、LM Studio、vLLM…）",
+        "region": "本地/自定义",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "key_url": "",
+        "models": [
+            {"id": "qwen2.5:7b", "name": "示例：Ollama 本地模型（请改成你的模型名）", "free": True},
+            {"id": "llama3.1:8b", "name": "示例：Llama 3.1 8B（本地）", "free": True},
+        ],
+    },
 }
+
+# 这些提供商通常不需要 API Key（本地/自建服务），允许留空直接运行。
+NO_KEY_PROVIDERS = ("local", "custom")
+
+
+def provider_needs_key(provider):
+    return (provider or "").lower() not in NO_KEY_PROVIDERS
 
 
 def providers_payload():
@@ -643,8 +660,10 @@ UI_HTML = r"""<!DOCTYPE html>
       <input id="apiKey" type="text" placeholder="sk-...（点上方链接去官网领取）">
       <label>Base URL（选模型自动填，可改）</label>
       <input id="baseUrl" type="text">
-      <label>模型</label>
+      <label>模型（下拉选择）</label>
       <select id="modelName"></select>
+      <label>自定义模型名（本地模型必填，留空则用上方所选）</label>
+      <input id="modelCustom" type="text" placeholder="例如 qwen2.5:7b / llama3.1:8b / deepseek-r1:7b">
       <div class="row">
         <button class="sec" onclick="saveConfig()">保存配置</button>
         <button class="ghost" onclick="testModel()">🔌 测试是否可用</button>
@@ -736,7 +755,12 @@ function onProviderChange(){
     o.textContent=(m.free?'[免费] ':'[计费] ')+m.name;
     msel.appendChild(o);
   }
-  document.getElementById('keyHint').innerHTML='官网领 Key：<a class="dl" href="'+p.key_url+'" target="_blank">'+p.key_url+'</a>（'+p.region+'）';
+  const hint=document.getElementById('keyHint');
+  if(key==='local'||key==='custom'){
+    hint.innerHTML='本地/自建模型通常<b>无需 API Key</b>，可留空。Base URL 改成你电脑或服务器的地址：Ollama 用 <code>http://内网IP:11434/v1</code>，LM Studio 用 <code>http://内网IP:1234/v1</code>；手机与电脑需在同一 WiFi，模型名填你本地已加载的模型（如 qwen2.5:7b）。';
+  }else{
+    hint.innerHTML='官网领 Key：<a class="dl" href="'+p.key_url+'" target="_blank">'+p.key_url+'</a>（'+p.region+'）';
+  }
 }
 
 function renderMarket(providers){
@@ -765,11 +789,12 @@ function useModel(pkey,mid){
 }
 
 async function saveConfig(){
+  const custom=document.getElementById('modelCustom').value.trim();
   const body={
     provider:document.getElementById('provider').value,
     api_key:document.getElementById('apiKey').value.trim(),
     base_url:document.getElementById('baseUrl').value.trim(),
-    model_name:document.getElementById('modelName').value.trim()
+    model_name:custom||document.getElementById('modelName').value.trim()
   };
   try{
     const r=await fetch(API+"/api/v1/mpt_config",{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -781,13 +806,15 @@ async function saveConfig(){
 
 async function testModel(){
   const res=document.getElementById('testResult');
+  const prov=document.getElementById('provider').value;
+  const custom=document.getElementById('modelCustom').value.trim();
   const body={
-    provider:document.getElementById('provider').value,
+    provider:prov,
     api_key:document.getElementById('apiKey').value.trim(),
     base_url:document.getElementById('baseUrl').value.trim(),
-    model_name:document.getElementById('modelName').value.trim()
+    model_name:custom||document.getElementById('modelName').value.trim()
   };
-  if(!body.api_key){res.textContent='请先填写 API Key 再测试。';return;}
+  if(!body.api_key && prov!=='local' && prov!=='custom'){res.textContent='请先填写 API Key 再测试。';return;}
   res.textContent='正在测试连接（约几秒）...';
   try{
     const r=await fetch(API+"/api/v1/test",{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -967,7 +994,7 @@ class Handler(BaseHTTPRequestHandler):
             if not subject:
                 self._send_json({"status": 400, "message": "缺少主题"}, 400)
                 return
-            if not cfg.get("api_key"):
+            if not cfg.get("api_key") and provider_needs_key(cfg.get("provider")):
                 self._send_json({"status": 400, "message": "请先在「配置」中填写 API Key"}, 400)
                 return
             try:
@@ -981,7 +1008,7 @@ class Handler(BaseHTTPRequestHandler):
             script = (body.get("video_script") or "").strip()
             subject = (body.get("video_subject") or "").strip()
             if not script:
-                if subject and cfg.get("api_key"):
+                if subject and (cfg.get("api_key") or not provider_needs_key(cfg.get("provider"))):
                     try:
                         script = generate_script(subject, cfg)
                     except Exception as e:
@@ -990,7 +1017,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._send_json({"status": 400, "message": "请先填写文案或主题(并配置Key)"}, 400)
                     return
-            if not cfg.get("api_key"):
+            if not cfg.get("api_key") and provider_needs_key(cfg.get("provider")):
                 self._send_json({"status": 400, "message": "请先配置 API Key"}, 400)
                 return
             voice = (body.get("voice_name") or "zh-CN-XiaoxiaoNeural-Female")
@@ -1005,7 +1032,7 @@ class Handler(BaseHTTPRequestHandler):
                 "base_url": (body.get("base_url") or "").strip(),
                 "model_name": (body.get("model_name") or "").strip(),
             }
-            if not cfg["api_key"]:
+            if not cfg["api_key"] and provider_needs_key(cfg["provider"]):
                 self._send_json({"status": 400, "message": "请先填写 API Key"}, 400)
                 return
             try:
