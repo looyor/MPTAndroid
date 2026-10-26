@@ -30,11 +30,12 @@ import requests
 import shutil
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
 except Exception as e:  # pragma: no cover
     Image = None
     ImageDraw = None
     ImageFont = None
+    ImageOps = None
     _PIL_ERROR = e
 
 # --------------------------------------------------------------------------- #
@@ -274,13 +275,25 @@ def chat_complete(provider, cfg, messages, temperature=0.8, timeout=120):
     return data["choices"][0]["message"]["content"].strip()
 
 
-def generate_script(subject, cfg):
+def generate_script(subject, cfg, word_count=None):
     provider = (cfg.get("provider") or "openai").lower()
+    # 字数约束（仅对中文文案有意义）
+    wc = None
+    try:
+        wc = int(word_count) if word_count not in (None, "", "0") else None
+    except Exception:
+        wc = None
     sys_prompt = (
         "你是一个短视频文案助手。请根据主题写一段适合配音的短视频口播文案，"
-        "语言与主题一致（中文主题用中文）。要求：5-8 句话，口语化、有节奏、"
+        "语言与主题一致（中文主题用中文）。要求：口语化、有节奏、"
         "不要分点、不要 markdown、不要括号里的动作提示。直接输出文案正文。"
     )
+    if wc and wc > 0:
+        wc = max(50, min(2000, wc))
+        sys_prompt += (
+            "正文严格控制在 %d 字左右（按中文字符数计），内容要充实连贯、"
+            "自然成段，不要为了凑字数而重复或堆砌。" % wc
+        )
     user_prompt = "主题：%s" % subject
     text = chat_complete(provider, cfg, [
         {"role": "system", "content": sys_prompt},
@@ -371,21 +384,25 @@ def wrap_cjk(text, font, max_w):
     return lines
 
 
+# 背景渐变图缓存：用 PIL 的 C 级线性渐变 + 着色，避免逐像素 Python 循环（提速关键）
+_BG_CACHE = {}
+
+
+def get_bg(w, h):
+    """生成一次渐变背景并缓存（按尺寸）。返回可安全 copy 的 Image。"""
+    key = (w, h)
+    if key in _BG_CACHE:
+        return _BG_CACHE[key].copy()
+    # Image.linear_gradient("L") 是 C 实现的 256x256 垂直灰度渐变，colorize 上色极快
+    base = Image.linear_gradient("L").resize((w, h))
+    bg = ImageOps.colorize(base, black=(18, 24, 38), white=(46, 52, 68))
+    _BG_CACHE[key] = bg
+    return bg.copy()
+
+
 def render_frame(text, w, h, idx, total, seed=0):
-    """生成一张竖/横版背景图（带渐变与字幕），返回 PNG 字节。"""
-    # 简单渐变配色，按句子序号轻微变化
-    hues = [(18, 24, 38), (30, 22, 40), (20, 34, 30), (34, 26, 22), (22, 28, 38)]
-    top = hues[(seed + idx) % len(hues)]
-    bot = tuple(min(255, c + 26) for c in top)
-    img = Image.new("RGB", (w, h), top)
-    px = img.load()
-    for y in range(h):
-        t = y / max(1, h - 1)
-        r = int(top[0] + (bot[0] - top[0]) * t)
-        g = int(top[1] + (bot[1] - top[1]) * t)
-        b = int(top[2] + (bot[2] - top[2]) * t)
-        for x in range(w):
-            px[x, y] = (r, g, b)
+    """在缓存渐变背景上叠加字幕，返回 PNG 字节（不再逐像素绘制）。"""
+    img = get_bg(w, h)
     draw = ImageDraw.Draw(img)
 
     # 半透明暗条增强字幕可读性
@@ -439,7 +456,7 @@ def split_sentences(text):
     return out
 
 
-def build_video(task_id, script, voice, aspect, cfg):
+def build_video(task_id, script, voice, aspect, cfg, duration_sec=0):
     sentences = split_sentences(script)
     if not sentences:
         raise RuntimeError("没有可生成的句子，请检查文案。")
@@ -447,41 +464,91 @@ def build_video(task_id, script, voice, aspect, cfg):
     res = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
     w, h = res.get(aspect, (1080, 1920))
 
+    lang = gtts_lang(voice)
+    # 时长控制：用户指定分钟数 → 视频总时长 ≈ duration_sec
+    # - 文案自然时长不足：循环文案把时长凑到指定值（配音不被截断）
+    # - 文案已够长：均分各句到指定总时长（超出部分截断静音）
+    # 关键：配音只对「原始句子」生成一次，循环时复用音频，避免重复网络请求。
+    seg_per = None
+    reps = 1
+    if duration_sec and duration_sec > 0:
+        natural = sum(max(estimate_duration(s, lang), 1.5) * 2 for s in sentences)
+        if natural < duration_sec - 2:
+            reps = max(1, int(math.ceil(duration_sec / max(natural, 1))))
+            seg_per = duration_sec / (len(sentences) * reps)
+        else:
+            seg_per = duration_sec / len(sentences)
+
     task_dir = os.path.join(MPT_HOME, "tasks", task_id)
     os.makedirs(task_dir, exist_ok=True)
     clips = []
 
-    total = len(sentences)
-    for i, sent in enumerate(sentences):
+    # 1) 仅为「原始句子」生成素材（图片+配音），循环时直接复用
+    originals = sentences[:]
+    assets = []  # (png_path, audio_path, dur)
+    n_orig = len(originals)
+    for i, sent in enumerate(originals):
         with TASKS_LOCK:
-            TASKS[task_id]["progress"] = int((i / total) * 80)
-        log(task_id, "处理第 %d/%d 句：%s" % (i + 1, total, sent[:20]))
-
+            TASKS[task_id]["progress"] = int((i / (n_orig * max(reps, 1))) * 60)
+        log(task_id, "生成第 %d/%d 句素材：%s" % (i + 1, n_orig, sent[:20]))
         png_path = os.path.join(task_dir, "frame_%03d.png" % i)
         with open(png_path, "wb") as f:
-            f.write(render_frame(sent, w, h, i, total, seed=0))
-
+            f.write(render_frame(sent, w, h, i, n_orig, seed=0))
         audio_path = os.path.join(task_dir, "audio_%03d.mp3" % i)
+        log(task_id, "  ↳ 生成配音中...")
         dur = tts_to_file(sent, voice, audio_path)
+        assets.append((png_path, audio_path, dur, sent))
 
-        clip_path = os.path.join(task_dir, "clip_%03d.mp4" % i)
-        if dur is None:
-            # 静音兜底
-            est = estimate_duration(sent, gtts_lang(voice))
-            run_ffmpeg([
-                "-y", "-loop", "1", "-i", png_path,
-                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25",
-                "-t", "%.2f" % est, "-c:a", "aac", "-b:a", "128k", "-shortest",
-                clip_path,
-            ], task_id)
+    # 2) 按 reps 循环展开成最终序列
+    seq = []
+    for _ in range(reps):
+        seq.extend(assets)
+    total = len(seq)
+
+    # 3) 逐段合成 clip（复用素材，仅改变展示时长）
+    for k, (png_path, audio_path, dur, sent) in enumerate(seq):
+        with TASKS_LOCK:
+            TASKS[task_id]["progress"] = 60 + int((k / total) * 25)
+        clip_path = os.path.join(task_dir, "clip_%03d.mp4" % k)
+        # ultrafast：移动端软编提速关键；画面分辨率保持 1080 系
+        if seg_per:
+            seg = max(1.0, seg_per)
+            if dur is None:
+                run_ffmpeg([
+                    "-y", "-loop", "1", "-i", png_path,
+                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-t", "%.2f" % seg,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "25",
+                    "-c:a", "aac", "-b:a", "128k", "-shortest",
+                    clip_path,
+                ], task_id)
+            else:
+                run_ffmpeg([
+                    "-y", "-loop", "1", "-i", png_path, "-i", audio_path,
+                    "-t", "%.2f" % seg,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "25",
+                    "-c:a", "aac", "-b:a", "128k", "-af", "apad", "-shortest",
+                    clip_path,
+                ], task_id)
         else:
-            run_ffmpeg([
-                "-y", "-loop", "1", "-i", png_path, "-i", audio_path,
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25",
-                "-t", "%.2f" % (dur * 2), "-c:a", "aac", "-b:a", "128k", "-shortest",
-                clip_path,
-            ], task_id)
+            if dur is None:
+                est = estimate_duration(sent, lang)
+                run_ffmpeg([
+                    "-y", "-loop", "1", "-i", png_path,
+                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-t", "%.2f" % est,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "25",
+                    "-c:a", "aac", "-b:a", "128k", "-shortest",
+                    clip_path,
+                ], task_id)
+            else:
+                run_ffmpeg([
+                    "-y", "-loop", "1", "-i", png_path, "-i", audio_path,
+                    "-t", "%.2f" % (dur * 2),
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "25",
+                    "-c:a", "aac", "-b:a", "128k", "-shortest",
+                    clip_path,
+                ], task_id)
         clips.append(clip_path)
 
     # 拼接
@@ -565,23 +632,23 @@ def pick_background_music():
 # --------------------------------------------------------------------------- #
 # 任务调度
 # --------------------------------------------------------------------------- #
-def create_task(script, voice, aspect, cfg):
+def create_task(script, voice, aspect, cfg, duration_sec=0):
     task_id = uuid.uuid4().hex[:12]
     with TASKS_LOCK:
         TASKS[task_id] = {
             "state": 0, "progress": 0, "videos": [], "error": "", "logs": [],
         }
     t = threading.Thread(
-        target=_run_task, args=(task_id, script, voice, aspect, cfg),
+        target=_run_task, args=(task_id, script, voice, aspect, cfg, duration_sec),
         daemon=True,
     )
     t.start()
     return task_id
 
 
-def _run_task(task_id, script, voice, aspect, cfg):
+def _run_task(task_id, script, voice, aspect, cfg, duration_sec=0):
     try:
-        build_video(task_id, script, voice, aspect, cfg)
+        build_video(task_id, script, voice, aspect, cfg, duration_sec)
     except Exception as e:
         tb = traceback.format_exc()
         log(task_id, "任务失败：%s" % e)
@@ -683,7 +750,10 @@ UI_HTML = r"""<!DOCTYPE html>
     <h2>③ 生成</h2>
     <label>视频主题 / 关键词</label>
     <input id="subject" type="text" placeholder="例如：春天的花海，治愈系短视频">
-    <button class="ghost" onclick="genScript()">AI 生成文案</button>
+    <div class="row">
+      <input id="wordCount" type="number" min="50" max="2000" step="50" placeholder="字数(留空随机，如300)" style="flex:1;min-width:0">
+      <button class="ghost" onclick="genScript()">AI 生成文案</button>
+    </div>
     <label>文案（可手动修改）</label>
     <textarea id="script" placeholder="在此填写或自动生成视频文案..."></textarea>
     <div class="row">
@@ -703,7 +773,24 @@ UI_HTML = r"""<!DOCTYPE html>
           <option value="1:1">方形 1:1</option>
         </select>
       </div>
+      <div>
+        <label>视频时长（分钟）</label>
+        <select id="durationMin">
+          <option value="0">自动</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+          <option value="6">6</option>
+          <option value="7">7</option>
+          <option value="8">8</option>
+          <option value="9">9</option>
+          <option value="10">10</option>
+        </select>
+      </div>
     </div>
+    <div class="hint" style="margin:6px 0 10px">时长选「自动」按配音自然长度；选 1~10 分钟会把视频拉伸/循环到指定长度（上限 10 分钟）。成片自动存到手机 <b>Download/Ai视频</b>（.mp4）。</div>
     <button onclick="genVideo()">▶ 生成视频</button>
   </div>
 
@@ -827,10 +914,11 @@ async function testModel(){
 async function genScript(){
   const subject=document.getElementById('subject').value.trim();
   if(!subject){alert('请先填写主题');return;}
+  const wc=document.getElementById('wordCount').value.trim();
   log('正在生成文案...');
   try{
     const r=await fetch(API+"/api/v1/scripts",{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({video_subject:subject})});
+      body:JSON.stringify({video_subject:subject, word_count:wc})});
     const j=await r.json();
     if(j && j.data && j.data.video_script){
       document.getElementById('script').value=j.data.video_script;
@@ -856,7 +944,8 @@ async function genVideo(){
       body:JSON.stringify({
         video_subject:subject||" ", video_script:script,
         video_aspect:document.getElementById('aspect').value,
-        voice_name:document.getElementById('voice').value
+        voice_name:document.getElementById('voice').value,
+        duration_min:document.getElementById('durationMin').value
       })});
     const j=await r.json();
     if(j && j.data && j.data.task_id){
@@ -991,6 +1080,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/v1/scripts":
             cfg = load_config()
             subject = (body.get("video_subject") or "").strip()
+            word_count = body.get("word_count")
             if not subject:
                 self._send_json({"status": 400, "message": "缺少主题"}, 400)
                 return
@@ -998,7 +1088,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"status": 400, "message": "请先在「配置」中填写 API Key"}, 400)
                 return
             try:
-                script = generate_script(subject, cfg)
+                script = generate_script(subject, cfg, word_count)
                 self._send_json({"status": 200, "data": {"video_script": script}})
             except Exception as e:
                 self._send_json({"status": 500, "message": "生成失败：%s" % e})
@@ -1022,7 +1112,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             voice = (body.get("voice_name") or "zh-CN-XiaoxiaoNeural-Female")
             aspect = (body.get("video_aspect") or "9:16")
-            task_id = create_task(script, voice, aspect, cfg)
+            # 视频时长（分钟）：0=自动，1~10 分钟；限制上限 10 分钟
+            duration_min = body.get("duration_min")
+            try:
+                duration_min = float(duration_min) if duration_min else 0
+            except Exception:
+                duration_min = 0
+            duration_sec = int(max(0, min(10, duration_min)) * 60)
+            task_id = create_task(script, voice, aspect, cfg, duration_sec)
             self._send_json({"status": 200, "data": {"task_id": task_id}})
 
         elif path == "/api/v1/test":
