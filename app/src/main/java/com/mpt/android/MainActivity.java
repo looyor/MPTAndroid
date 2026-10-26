@@ -29,6 +29,32 @@ public class MainActivity extends AppCompatActivity {
     private static final int PORT = 8080;
     private WebView webView;
 
+    private static final String LOADING_HTML =
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            + "<style>html,body{margin:0;height:100%;background:#0b0c10;color:#e8e8ef;"
+            + "font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;"
+            + "flex-direction:column;align-items:center;justify-content:center}"
+            + ".t{font-size:20px;font-weight:700;letter-spacing:.5px}"
+            + ".s{margin-top:14px;font-size:13px;color:#9aa0b4}"
+            + ".ring{margin-top:26px;width:38px;height:38px;border:4px solid #2b2f4a;"
+            + "border-top-color:#7c5cff;border-radius:50%;animation:spin 1s linear infinite}"
+            + "@keyframes spin{to{transform:rotate(360deg)}}</style></head>"
+            + "<body><div class='t'>MPT&nbsp;Turbo</div><div class='s'>正在启动本地服务…</div>"
+            + "<div class='ring'></div></body></html>";
+
+    private static final String ERROR_HTML =
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            + "<style>html,body{margin:0;height:100%;background:#0b0c10;color:#e8e8ef;"
+            + "font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;"
+            + "flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center}"
+            + ".t{font-size:19px;font-weight:700;color:#ff6b6b}"
+            + ".s{margin-top:12px;font-size:13px;color:#9aa0b4;line-height:1.6}</style></head>"
+            + "<body><div class='t'>服务启动失败</div>"
+            + "<div class='s'>Python 本地服务未能在 60 秒内就绪。<br>"
+            + "请重启应用；若仍失败，用电脑执行 adb logcat 查看详细错误。</div></body></html>";
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -41,6 +67,9 @@ public class MainActivity extends AppCompatActivity {
         webView.getSettings().setMediaPlaybackRequiresUserGesture(false);
         webView.setWebViewClient(new WebViewClient());
         webView.setWebChromeClient(new WebChromeClient());
+
+        // 先展示启动加载页，避免服务未就绪时出现空白白屏。
+        webView.loadDataWithBaseURL(null, LOADING_HTML, "text/html", "utf-8", null);
 
         // 0) 申请存储权限（导出视频到 Download/Ai视频 需要）
         ensureStoragePermission();
@@ -72,6 +101,7 @@ public class MainActivity extends AppCompatActivity {
                 if (serverUp) {
                     webView.loadUrl("http://127.0.0.1:" + PORT + "/");
                 } else {
+                    webView.loadDataWithBaseURL(null, ERROR_HTML, "text/html", "utf-8", null);
                     Toast.makeText(MainActivity.this,
                             "服务启动失败，请查看 logcat", Toast.LENGTH_LONG).show();
                 }
