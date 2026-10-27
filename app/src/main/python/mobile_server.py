@@ -2,8 +2,9 @@
 """
 MoneyPrinterTurbo Android —— 轻量后端（无 FastAPI / 无 pydantic）
 
-纯标准库 HTTP 服务 + requests 直连大模型 + gTTS 配音 + PIL 渲染字幕 +
-直接用内置 ffmpeg 合成视频。所有第三方依赖只有 requests / gtts / pillow，
+纯标准库 HTTP 服务 + requests 直连大模型 + edge-tts 配音（微软在线，
+国内直连、可设超时，避免旧 gTTS 访问 Google 无限阻塞）+ PIL 渲染字幕 +
+直接用内置 ffmpeg 合成视频。所有第三方依赖只有 requests / edge-tts / pillow，
 都能在 Chaquopy(Android, aarch64) 上正常安装，规避 pydantic-core 等
 无法在安卓编译的 Rust 扩展。
 
@@ -307,7 +308,7 @@ def generate_script(subject, cfg, word_count=None):
 
 
 # --------------------------------------------------------------------------- #
-# 配音（gTTS）
+# 配音（edge-tts，微软在线 TTS）
 # --------------------------------------------------------------------------- #
 def gtts_lang(voice):
     v = (voice or "").lower()
@@ -330,15 +331,34 @@ def gtts_lang(voice):
     return "zh-CN"
 
 
-def tts_to_file(text, voice, out_path):
-    """返回音频时长（秒）的估计值；失败时返回 None（后续用静音兜底）。"""
+def tts_to_file(text, voice, out_path, timeout=60):
+    """用 edge-tts（微软在线 TTS，国内直连）生成配音。
+
+    返回音频时长（秒）估计值；超时/失败返回 None（后续用静音兜底）。
+    关键：用 asyncio.wait_for 加超时，避免像旧 gTTS 那样访问 Google
+    无限阻塞，从而导致「进度一直 0%」且永不报错。
+    """
+    lang = gtts_lang(voice)
     try:
-        from gtts import gTTS
-        lang = gtts_lang(voice)
-        gTTS(text=text, lang=lang, slow=False).save(out_path)
+        import asyncio
+        import edge_tts
+
+        async def _gen():
+            # voice 形如 zh-CN-XiaoxiaoNeural（不含 -Female 后缀）
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(out_path)
+
+        asyncio.run(asyncio.wait_for(_gen(), timeout=timeout))
+        if not (os.path.isfile(out_path) and os.path.getsize(out_path) > 0):
+            raise RuntimeError("edge-tts 未产出有效音频")
         return estimate_duration(text, lang)
     except Exception as e:
-        print("tts error: %s" % e, flush=True)
+        print("tts(edge) error: %s" % e, flush=True)
+        try:
+            if os.path.isfile(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
         return None
 
 
@@ -497,6 +517,8 @@ def build_video(task_id, script, voice, aspect, cfg, duration_sec=0):
             f.write(render_frame(sent, w, h, i, n_orig, seed=0))
         audio_path = os.path.join(task_dir, "audio_%03d.mp3" % i)
         dur = tts_to_file(sent, voice, audio_path)
+        if dur is None:
+            log(task_id, "⚠ 第%d句配音失败（edge-tts 不可用？），该句将以静音兜底" % (i + 1))
         assets[i] = (png_path, audio_path, dur, sent)
 
     log(task_id, "并行生成 %d 句素材（图片+配音）..." % n_orig)
@@ -765,9 +787,13 @@ UI_HTML = r"""<!DOCTYPE html>
       <div>
         <label>配音语言</label>
         <select id="voice">
-          <option value="zh-CN-XiaoxiaoNeural-Female">中文</option>
-          <option value="en-US-AriaNeural-Female">English</option>
-          <option value="ja-JP-NanamiNeural-Female">日本語</option>
+          <option value="zh-CN-XiaoxiaoNeural">中文·晓晓(女)</option>
+          <option value="zh-CN-YunxiNeural">中文·云希(男)</option>
+          <option value="zh-CN-YunyangNeural">中文·云扬(男·新闻)</option>
+          <option value="en-US-AriaNeural">English·Aria</option>
+          <option value="en-US-GuyNeural">English·Guy</option>
+          <option value="ja-JP-NanamiNeural">日本語·七海</option>
+          <option value="ja-JP-KeitaNeural">日本語・啓太</option>
         </select>
       </div>
       <div>
@@ -1115,7 +1141,7 @@ class Handler(BaseHTTPRequestHandler):
             if not cfg.get("api_key") and provider_needs_key(cfg.get("provider")):
                 self._send_json({"status": 400, "message": "请先配置 API Key"}, 400)
                 return
-            voice = (body.get("voice_name") or "zh-CN-XiaoxiaoNeural-Female")
+            voice = (body.get("voice_name") or "zh-CN-XiaoxiaoNeural")
             aspect = (body.get("video_aspect") or "9:16")
             # 视频时长（分钟）：0=自动，1~10 分钟；限制上限 10 分钟
             duration_min = body.get("duration_min")
