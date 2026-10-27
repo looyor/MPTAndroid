@@ -23,6 +23,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -413,12 +414,15 @@ def render_frame(text, w, h, idx, total, seed=0):
     font = load_font(int(h * 0.055))
     max_w = int(w * 0.86)
     lines = wrap_cjk(text, font, max_w)
-    line_h = int(font.size * 1.35)
+    line_h = int(font.size * 1.4)
     total_h = line_h * len(lines)
     y = int((h - total_h) / 2)
+    # 白字 + 黑色描边，强对比提升清晰度（尤其小屏/压缩后）
     for line in lines:
         lw = font.getlength(line)
-        draw.text(((w - lw) / 2, y), line, font=font, fill=(255, 255, 255))
+        x = (w - lw) / 2
+        draw.text((x, y), line, font=font, fill=(255, 255, 255),
+                  stroke_width=max(2, int(font.size * 0.02)), stroke_fill=(0, 0, 0))
         y += line_h
 
     # 进度点
@@ -481,83 +485,84 @@ def build_video(task_id, script, voice, aspect, cfg, duration_sec=0):
 
     task_dir = os.path.join(MPT_HOME, "tasks", task_id)
     os.makedirs(task_dir, exist_ok=True)
-    clips = []
 
-    # 1) 仅为「原始句子」生成素材（图片+配音），循环时直接复用
+    # 1) 仅为「原始句子」生成素材（图片+配音），并发生成以掩盖网络延迟
     originals = sentences[:]
-    assets = []  # (png_path, audio_path, dur)
     n_orig = len(originals)
-    for i, sent in enumerate(originals):
-        with TASKS_LOCK:
-            TASKS[task_id]["progress"] = int((i / (n_orig * max(reps, 1))) * 60)
-        log(task_id, "生成第 %d/%d 句素材：%s" % (i + 1, n_orig, sent[:20]))
+    assets = [None] * n_orig
+
+    def make_asset(i, sent):
         png_path = os.path.join(task_dir, "frame_%03d.png" % i)
         with open(png_path, "wb") as f:
             f.write(render_frame(sent, w, h, i, n_orig, seed=0))
         audio_path = os.path.join(task_dir, "audio_%03d.mp3" % i)
-        log(task_id, "  ↳ 生成配音中...")
         dur = tts_to_file(sent, voice, audio_path)
-        assets.append((png_path, audio_path, dur, sent))
+        assets[i] = (png_path, audio_path, dur, sent)
 
-    # 2) 按 reps 循环展开成最终序列
-    seq = []
-    for _ in range(reps):
-        seq.extend(assets)
-    total = len(seq)
+    log(task_id, "并行生成 %d 句素材（图片+配音）..." % n_orig)
+    done_a = 0
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs_a = {ex.submit(make_asset, i, originals[i]): i for i in range(n_orig)}
+        for fut in as_completed(futs_a):
+            fut.result()
+            done_a += 1
+            with TASKS_LOCK:
+                TASKS[task_id]["progress"] = int((done_a / n_orig) * 55)
 
-    # 3) 逐段合成 clip（复用素材，仅改变展示时长）
-    for k, (png_path, audio_path, dur, sent) in enumerate(seq):
-        with TASKS_LOCK:
-            TASKS[task_id]["progress"] = 60 + int((k / total) * 25)
-        clip_path = os.path.join(task_dir, "clip_%03d.mp4" % k)
-        # ultrafast：移动端软编提速关键；画面分辨率保持 1080 系
+    # 2) 为每个「原始句子」编码一个 clip（去重：循环文案时复用同一 clip，不重复编码）
+    def clip_seg_of(asset):
+        _, _, dur, sent = asset
         if seg_per:
-            seg = max(1.0, seg_per)
-            if dur is None:
-                run_ffmpeg([
-                    "-y", "-loop", "1", "-i", png_path,
-                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                    "-t", "%.2f" % seg,
-                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "25",
-                    "-c:a", "aac", "-b:a", "128k", "-shortest",
-                    clip_path,
-                ], task_id)
-            else:
-                run_ffmpeg([
-                    "-y", "-loop", "1", "-i", png_path, "-i", audio_path,
-                    "-t", "%.2f" % seg,
-                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "25",
-                    "-c:a", "aac", "-b:a", "128k", "-af", "apad", "-shortest",
-                    clip_path,
-                ], task_id)
-        else:
-            if dur is None:
-                est = estimate_duration(sent, lang)
-                run_ffmpeg([
-                    "-y", "-loop", "1", "-i", png_path,
-                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                    "-t", "%.2f" % est,
-                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "25",
-                    "-c:a", "aac", "-b:a", "128k", "-shortest",
-                    clip_path,
-                ], task_id)
-            else:
-                run_ffmpeg([
-                    "-y", "-loop", "1", "-i", png_path, "-i", audio_path,
-                    "-t", "%.2f" % (dur * 2),
-                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "25",
-                    "-c:a", "aac", "-b:a", "128k", "-shortest",
-                    clip_path,
-                ], task_id)
-        clips.append(clip_path)
+            return max(1.0, seg_per)
+        return estimate_duration(sent, lang) if dur is None else dur * 2
 
-    # 拼接
-    log(task_id, "拼接 %d 个片段..." % len(clips))
+    def encode_asset(i):
+        png_path, audio_path, dur, sent = assets[i]
+        seg = clip_seg_of(assets[i])
+        clip_path = os.path.join(task_dir, "clip_%03d.mp4" % i)
+        # -crf 20 保证高清；-r 20 静态画面够流畅；-threads 2 防止压垮手机
+        if dur is None:
+            run_ffmpeg([
+                "-y", "-loop", "1", "-i", png_path,
+                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-t", "%.2f" % seg,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-r", "20", "-threads", "2",
+                "-c:a", "aac", "-b:a", "128k", "-shortest", clip_path,
+            ], task_id)
+        else:
+            run_ffmpeg([
+                "-y", "-loop", "1", "-i", png_path, "-i", audio_path,
+                "-t", "%.2f" % seg,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-r", "20", "-threads", "2",
+                "-c:a", "aac", "-b:a", "128k", "-af", "apad", "-shortest", clip_path,
+            ], task_id)
+        return clip_path
+
+    log(task_id, "并发编码 %d 个片段（已去重，循环文案只编码原始句）..." % n_orig)
+    asset_clips = [None] * n_orig
+    done_c = 0
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs_c = {ex.submit(encode_asset, i): i for i in range(n_orig)}
+        for fut in as_completed(futs_c):
+            i = futs_c[fut]
+            asset_clips[i] = fut.result()
+            done_c += 1
+            with TASKS_LOCK:
+                TASKS[task_id]["progress"] = 55 + int((done_c / n_orig) * 30)
+
+    # 3) 按 reps 展开最终序列（去重引用同一 clip 文件，避免重复编码）
+    seq_clip_paths = [asset_clips[k % n_orig] for k in range(n_orig * reps)]
+    total = len(seq_clip_paths)
+
+    # 拼接（复制流，不重编码，极快）
+    log(task_id, "拼接 %d 个片段..." % total)
     with TASKS_LOCK:
         TASKS[task_id]["progress"] = 85
     list_path = os.path.join(task_dir, "concat.txt")
     with open(list_path, "w", encoding="utf-8") as f:
-        for c in clips:
+        for c in seq_clip_paths:
             f.write("file '%s'\n" % c.replace("'", "'\\''"))
 
     final_path = os.path.join(task_dir, "final.mp4")
