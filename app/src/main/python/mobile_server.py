@@ -857,6 +857,34 @@ async function loadProviders(){
     }
     onProviderChange();
     renderMarket(providers);
+    // 启动即回填上次保存的配置（Key/URL/模型），实现「只填一次」
+    loadSavedConfig();
+  }catch(e){console.error(e);}
+}
+
+// 读取已保存配置并回填到表单；若保存的 provider/model 不在下拉里则临时补一个选项
+async function loadSavedConfig(){
+  try{
+    const r=await fetch(API+"/api/v1/mpt_config");
+    const j=await r.json();
+    const c=(j.data)||{};
+    const prov=document.getElementById('provider');
+    if(c.provider){
+      if(![...prov.options].some(o=>o.value===c.provider)){
+        const o=document.createElement('option');o.value=c.provider;o.textContent=c.provider;prov.appendChild(o);
+      }
+      prov.value=c.provider;
+    }
+    onProviderChange(); // 重建模型列表 + 设默认 Base URL
+    if(c.base_url) document.getElementById('baseUrl').value=c.base_url;
+    if(c.api_key) document.getElementById('apiKey').value=c.api_key;
+    if(c.model_name){
+      const m=document.getElementById('modelName');
+      if(![...m.options].some(o=>o.value===c.model_name)){
+        const o=document.createElement('option');o.value=c.model_name;o.textContent=c.model_name;m.appendChild(o);
+      }
+      m.value=c.model_name;
+    }
   }catch(e){console.error(e);}
 }
 
@@ -1076,6 +1104,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif path == "/api/v1/providers":
             self._send_json({"status": 200, "data": {"providers": providers_payload()}})
+        elif path == "/api/v1/mpt_config":
+            # 启动即返回已保存配置，前端据此回填表单，实现「Key 只填一次」
+            self._send_json({"status": 200, "data": load_config()})
         elif path.startswith("/api/v1/tasks/"):
             self._handle_task_get(path.split("/")[-1])
         elif path.startswith("/tasks/"):
