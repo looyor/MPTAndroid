@@ -566,30 +566,11 @@ def get_bg(w, h):
 
 
 def render_frame(text, w, h, idx, total, seed=0):
-    """在缓存渐变背景上叠加半透明字幕条与居中字幕，返回 PNG 字节。"""
-    base = get_bg(w, h).convert("RGB")
-    # 真正的半透明字幕条：在 RGBA 覆盖层绘制后再 alpha 合成。
-    # 旧写法 fill=(0,0,0,0) 在 RGB 图上 alpha 失效，会变成纯黑实心矩形（画面像断成两半）。
-    bar_h = int(h * 0.44)
-    bar_y = int((h - bar_h) / 2)
-    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    ImageDraw.Draw(overlay).rectangle([0, bar_y, w, bar_y + bar_h], fill=(0, 0, 0, 120))
-    img = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+    """在缓存渐变背景上叠加底部字幕条与居中字幕，返回 PNG 字节。"""
+    base = get_bg(w, h).convert("RGB").convert("RGBA")
+    img = base
     draw = ImageDraw.Draw(img)
-
-    font = load_font(int(h * 0.055))
-    max_w = int(w * 0.86)
-    lines = wrap_cjk(text, font, max_w)
-    line_h = int(font.size * 1.4)
-    total_h = line_h * len(lines)
-    y = int((h - total_h) / 2)
-    # 白字 + 黑色描边，强对比提升清晰度（尤其小屏/压缩后）
-    for line in lines:
-        lw = font.getlength(line)
-        x = (w - lw) / 2
-        draw.text((x, y), line, font=font, fill=(255, 255, 255),
-                  stroke_width=max(2, int(font.size * 0.02)), stroke_fill=(0, 0, 0))
-        y += line_h
+    draw_caption(draw, text, w, h)
 
     # 进度点
     dot_y = int(h * 0.92)
@@ -608,27 +589,44 @@ def render_frame(text, w, h, idx, total, seed=0):
 # --------------------------------------------------------------------------- #
 # 素材获取（Pexels 真实视频 + 离线动态背景）与片段合成
 # --------------------------------------------------------------------------- #
-def render_subtitle_png(text, w, h):
-    """渲染透明背景 + 半透明底栏 + 居中描边白字，用于叠加到真实视频素材上。"""
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    font = load_font(int(h * 0.055))
-    max_w = int(w * 0.86)
+def draw_caption(draw, text, w, h, size_factor=0.058):
+    """抖音短剧风格字幕：底部居中、圆角半透明底栏 + 描边白字（醒目、不挡主体）。
+
+    直接在传入的 ImageDraw 上绘制（透明层或实底都行），返回占用高度，供调用方复用。
+    """
+    font = load_font(int(h * size_factor))
+    max_w = int(w * 0.88)
     lines = wrap_cjk(text, font, max_w)
-    line_h = int(font.size * 1.4)
-    total_h = line_h * len(lines)
-    y0 = int((h - total_h) / 2)
-    # 半透明底栏提升在真实画面上的可读性
-    bar_h = total_h + int(h * 0.06)
-    bar_y = int((h - bar_h) / 2)
-    draw.rectangle([0, bar_y, w, bar_y + bar_h], fill=(0, 0, 0, 110))
-    y = y0
-    for line in lines:
-        lw = font.getlength(line)
+    line_h = int(font.size * 1.42)
+    pad_y = int(font.size * 0.5)
+    pad_x = int(font.size * 0.7)
+    line_ws = [font.getlength(l) for l in lines]
+    block_w = max(line_ws) + pad_x * 2
+    block_h = line_h * len(lines) + pad_y * 2
+    bx = int((w - block_w) / 2)
+    by = int(h * 0.72)  # 底部偏下，抖音/短剧常见位置，给画面主体留白
+    # 圆角底栏：强对比、提升在复杂真实画面上的可读性
+    try:
+        draw.rounded_rectangle([bx, by, bx + block_w, by + block_h],
+                               radius=int(font.size * 0.45),
+                               fill=(0, 0, 0, 150))
+    except Exception:
+        draw.rectangle([bx, by, bx + block_w, by + block_h], fill=(0, 0, 0, 150))
+    y = by + pad_y
+    for i, line in enumerate(lines):
+        lw = line_ws[i]
         x = (w - lw) / 2
         draw.text((x, y), line, font=font, fill=(255, 255, 255),
-                  stroke_width=max(2, int(font.size * 0.02)), stroke_fill=(0, 0, 0))
+                  stroke_width=max(3, int(font.size * 0.035)), stroke_fill=(0, 0, 0))
         y += line_h
+    return block_h
+
+
+def render_subtitle_png(text, w, h):
+    """渲染透明背景 + 底部圆角字幕条，用于叠加到真实视频素材上（抖音风格）。"""
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw_caption(draw, text, w, h)
     import io
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -661,14 +659,16 @@ def fetch_pexels_clip(keyword, subject, aspect, task_dir, idx, api_key, timeout=
                         cands.append((vw, vh, link))
             if not cands:
                 continue
-            cands.sort(key=lambda x: x[0])
-            pick = None
-            for c in cands:  # 优先选 480~1280 宽，体积小、解码快
-                if 480 <= c[0] <= 1280:
-                    pick = c
-                    break
-            if not pick:
-                pick = cands[len(cands) // 2]
+            # 优先 1080p 及以上高清素材（抖音短剧画质），避免低分辨率被拉伸糊掉。
+            # 在“高清候选”里挑最接近 1080 的一档（避开 4K 体积过大、解码慢）。
+            hd = [c for c in cands if c[1] >= 1080]
+            if hd:
+                hd.sort(key=lambda x: x[1])
+                pick = hd[0]
+            else:
+                # 没有高清则退而求其次，选已有分辨率里最高的一档
+                cands.sort(key=lambda x: x[1], reverse=True)
+                pick = cands[0]
             out = os.path.join(task_dir, "bg_%03d.mp4" % idx)
             dr = requests.get(pick[2], headers=headers, timeout=timeout, stream=True)
             dr.raise_for_status()
@@ -689,7 +689,29 @@ def fetch_pexels_clip(keyword, subject, aspect, task_dir, idx, api_key, timeout=
     return None
 
 
-def compose_online(bg_video, sub_png, audio_path, w, h, out_path):
+def encode_common(quality="hd"):
+    """统一的 H.264 编码参数。
+
+    hd（高清优先，默认）：veryfast + crf18 + High profile + 码率上限 10M，
+      画面接近抖音短剧；fast（极速）：ultrafast + crf23，弱机也能快速出片。
+    """
+    if quality == "fast":
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
+                "-threads", "2",
+                "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
+                "-movflags", "+faststart"]
+    # 高清优先
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-profile:v", "high", "-level", "4.0",
+            "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
+            "-maxrate", "10M", "-bufsize", "20M",
+            "-threads", "2",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+            "-movflags", "+faststart"]
+
+
+def compose_online(bg_video, sub_png, audio_path, w, h, out_path, quality="hd"):
     """在线：真实视频素材缩放裁剪铺满 → 叠加透明字幕 → 混入配音。"""
     has_audio = bool(audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0)
     inputs = ["-y", "-stream_loop", "-1", "-i", bg_video]
@@ -706,17 +728,14 @@ def compose_online(bg_video, sub_png, audio_path, w, h, out_path):
         vmap = "[v]"
     else:
         vmap = "[bg]"
-    common = ["-filter_complex", fc, "-map", vmap, "-map", "%d:a" % aid,
-              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-              "-pix_fmt", "yuv420p", "-r", "25", "-threads", "2",
-              "-c:a", "aac", "-b:a", "128k", out_path]
+    common = ["-filter_complex", fc, "-map", vmap, "-map", "%d:a" % aid] + encode_common(quality)
     if has_audio:
         run_ffmpeg(inputs + ["-shortest"] + common)
     else:
         run_ffmpeg(inputs + ["-t", "8.0"] + common)
 
 
-def compose_offline(card_png, audio_path, w, h, dur, out_path):
+def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd"):
     """离线兜底：对字幕卡做缓慢平移缩放(Ken Burns)生成动态背景 + 配音。"""
     has_audio = bool(audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0)
     inputs = ["-y", "-loop", "1", "-i", card_png]
@@ -726,9 +745,7 @@ def compose_offline(card_png, audio_path, w, h, dur, out_path):
         inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
     vf = ("scale='iw*1.12':'ih*1.12',"
           "crop=%d:%d:x='(iw-%d)/2+18*sin(t*0.35)':y='(ih-%d)/2+14*cos(t*0.28)'" % (w, h, w, h))
-    common = ["-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-              "-pix_fmt", "yuv420p", "-r", "25", "-threads", "2",
-              "-c:a", "aac", "-b:a", "128k", out_path]
+    common = ["-vf", vf] + encode_common(quality)
     if has_audio:
         run_ffmpeg(inputs + ["-shortest"] + common)
     else:
@@ -756,18 +773,21 @@ def split_sentences(text):
     return out
 
 
-def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0):
+def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd"):
     """用「真实视频素材 + 字幕 + 配音」合成真短视频。
 
     plan = {'script': 正文, 'segments':[{'text','keyword'}]}
     每个 segment：优先用 Pexels 真实视频作背景并叠加透明字幕；无 Key/联网失败
     则退化为本地字幕卡做 Ken Burns 动态背景（离线，仍是动态画面而非死图）。
+    quality: 'hd'(高清优先，默认) / 'fast'(极速)。
     """
     segments = plan.get("segments") or []
     if not segments:
         raise RuntimeError("没有可生成的句子，请检查文案。")
     subject = (plan.get("script") or "").strip()
     pexels_key = (cfg.get("pexels_api_key") or "").strip()
+    if quality not in ("hd", "fast"):
+        quality = "hd"
 
     res = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
     w, h = res.get(aspect, (1080, 1920))
@@ -829,9 +849,9 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0):
         clip_path = os.path.join(task_dir, "clip_%03d.mp4" % i)
         try:
             if p["mode"] == "online":
-                compose_online(p["bg"], p["sub"], p["audio"], w, h, clip_path)
+                compose_online(p["bg"], p["sub"], p["audio"], w, h, clip_path, quality)
             else:
-                compose_offline(p["card"], p["audio"], w, h, dur, clip_path)
+                compose_offline(p["card"], p["audio"], w, h, dur, clip_path, quality)
         except Exception as e:
             # 真实素材解码失败等 → 退回离线动态背景，保证出片
             log(task_id, "片段%d 合成失败，退回离线背景：%s" % (i + 1, e))
@@ -839,7 +859,7 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0):
             if not (os.path.isfile(card_path) and os.path.getsize(card_path) > 0):
                 with open(card_path, "wb") as f:
                     f.write(render_frame(segments[i]["text"], w, h, i, n_orig, seed=0))
-            compose_offline(card_path, p["audio"], w, h, dur, clip_path)
+            compose_offline(card_path, p["audio"], w, h, dur, clip_path, quality)
         return clip_path
 
     log(task_id, "并发编码 %d 个片段..." % n_orig)
@@ -867,7 +887,7 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0):
     final_path = os.path.join(task_dir, "final.mp4")
     run_ffmpeg([
         "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-        "-c", "copy", final_path,
+        "-c", "copy", "-movflags", "+faststart", final_path,
     ], task_id)
 
     # 可选：叠加内置背景音乐（失败不影响成片）
@@ -879,6 +899,7 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0):
                 "-y", "-i", final_path, "-i", music,
                 "-filter_complex", "[1:a]volume=0.25[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]",
                 "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-shortest",
+                "-movflags", "+faststart",
                 mixed,
             ], task_id)
             if os.path.isfile(mixed) and os.path.getsize(mixed) > 0:
@@ -936,23 +957,23 @@ def pick_background_music():
 # --------------------------------------------------------------------------- #
 # 任务调度
 # --------------------------------------------------------------------------- #
-def create_task(plan, voice, aspect, cfg, duration_sec=0):
+def create_task(plan, voice, aspect, cfg, duration_sec=0, quality="hd"):
     task_id = uuid.uuid4().hex[:12]
     with TASKS_LOCK:
         TASKS[task_id] = {
             "state": 0, "progress": 0, "videos": [], "error": "", "logs": [],
         }
     t = threading.Thread(
-        target=_run_task, args=(task_id, plan, voice, aspect, cfg, duration_sec),
+        target=_run_task, args=(task_id, plan, voice, aspect, cfg, duration_sec, quality),
         daemon=True,
     )
     t.start()
     return task_id
 
 
-def _run_task(task_id, plan, voice, aspect, cfg, duration_sec=0):
+def _run_task(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd"):
     try:
-        build_video(task_id, plan, voice, aspect, cfg, duration_sec)
+        build_video(task_id, plan, voice, aspect, cfg, duration_sec, quality)
     except Exception as e:
         tb = traceback.format_exc()
         log(task_id, "任务失败：%s" % e)
@@ -1125,6 +1146,15 @@ UI_HTML = r"""<!DOCTYPE html>
           <option value="8">8</option>
           <option value="9">9</option>
           <option value="10">10</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>画质（清晰度）</label>
+        <select id="quality">
+          <option value="hd" selected>高清优先（推荐·近抖音）</option>
+          <option value="fast">极速生成（弱机/求快）</option>
         </select>
       </div>
     </div>
@@ -1319,7 +1349,8 @@ async function genVideo(){
         video_subject:subject||" ", video_script:script,
         segments:segments, video_aspect:document.getElementById('aspect').value,
         voice_name:document.getElementById('voice').value,
-        duration_min:document.getElementById('durationMin').value
+        duration_min:document.getElementById('durationMin').value,
+        quality:document.getElementById('quality').value
       })});
     const j=await r.json();
     if(j && j.data && j.data.task_id){
@@ -1521,6 +1552,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             voice = (body.get("voice_name") or "zh-CN-XiaoxiaoNeural")
             aspect = (body.get("video_aspect") or "9:16")
+            # 画质：'hd' 高清优先（默认，接近抖音短剧）/ 'fast' 极速
+            quality = (body.get("quality") or "hd")
+            if quality not in ("hd", "fast"):
+                quality = "hd"
             # 视频时长（分钟）：0=自动，1~10 分钟；限制上限 10 分钟
             duration_min = body.get("duration_min")
             try:
@@ -1528,7 +1563,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 duration_min = 0
             duration_sec = int(max(0, min(10, duration_min)) * 60)
-            task_id = create_task(plan, voice, aspect, cfg, duration_sec)
+            task_id = create_task(plan, voice, aspect, cfg, duration_sec, quality)
             self._send_json({"status": 200, "data": {"task_id": task_id}})
 
         elif path == "/api/v1/test":
