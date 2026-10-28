@@ -241,15 +241,117 @@ def ffmpeg_bin():
     return FFMPEG_PATH or os.environ.get("MPT_FFMPEG") or "ffmpeg"
 
 
+def _ff_err_brief(err):
+    """从 ffmpeg stderr 里抽一条最有信息量的错误行，用于弹窗提示。"""
+    lines = [l.strip() for l in (err or "").splitlines() if l.strip()]
+    for l in reversed(lines):
+        low = l.lower()
+        if ("error" in low or "invalid" in low or "unable" in low
+                or "no such" in low or "not found" in low or "failed" in low
+                or "unsupported" in low or "unknown" in low):
+            return l[:200]
+    return (lines[-1][:200] if lines else "")
+
+
 def run_ffmpeg(args, task_id=None, timeout=600):
     cmd = [ffmpeg_bin()] + args
-    log(task_id, "ffmpeg " + " ".join(args[:6]) + (" ..." if len(args) > 6 else ""))
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    log(task_id, "ffmpeg " + " ".join(args))
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except Exception as e:
+        # 二进制无法执行 / 超时（不是 ffmpeg 参数问题）
+        log(task_id, "ffmpeg 调用异常：%s" % e)
+        raise RuntimeError("ffmpeg 无法执行：%s" % e)
     if p.returncode != 0:
         err = p.stderr.decode("utf-8", "ignore")
-        log(task_id, "ffmpeg 返回 %d: %s" % (p.returncode, err[-500:]))
-        raise RuntimeError("ffmpeg 失败(%d)" % p.returncode)
+        log(task_id, "ffmpeg 返回 %d: %s" % (p.returncode, err[-800:]))
+        brief = _ff_err_brief(err)
+        raise RuntimeError("ffmpeg 失败(%d)%s" % (p.returncode, ("：" + brief) if brief else ""))
     return p
+
+
+# --------------------------------------------------------------------------- #
+# ffmpeg 能力探测：不同安卓构建的编码器/滤镜差异很大，
+# 先探测可用的视频编码器，避免「参数不被支持 → 整任务失败」。
+# --------------------------------------------------------------------------- #
+_FF_CAPS = {"done": False, "encoder": None, "version": "", "encoders": []}
+_FF_CAPS_LOCK = threading.Lock()
+
+
+def probe_ffmpeg(task_id=None):
+    """探测 ffmpeg 版本与可用的 H.264/MPEG4 编码器；结果缓存，只跑一次。"""
+    with _FF_CAPS_LOCK:
+        if _FF_CAPS["done"]:
+            return dict(_FF_CAPS)
+        ver = ""
+        encs = []
+        try:
+            p = subprocess.run([ffmpeg_bin(), "-hide_banner", "-version"],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+            out = p.stdout.decode("utf-8", "ignore")
+            first = (out.splitlines() or [""])[0]
+            ver = first.strip()[:120]
+        except Exception as e:
+            log(task_id, "探测 ffmpeg 版本失败：%s" % e)
+        try:
+            p = subprocess.run([ffmpeg_bin(), "-hide_banner", "-encoders"],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+            out = p.stdout.decode("utf-8", "ignore")
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].startswith("V"):
+                    encs.append(parts[1])
+        except Exception as e:
+            log(task_id, "探测编码器列表失败：%s" % e)
+        # 优先级：软编 libx264（画质最好）→ 硬件 mediacodec → mpeg4（永远存在）
+        pick = None
+        for cand in ("libx264", "h264_mediacodec", "h264", "mpeg4"):
+            if cand in encs:
+                pick = cand
+                break
+        if pick is None and not encs:
+            # -encoders 不可用时，退而用「实拍测试」决定
+            pick = "libx264"
+        _FF_CAPS.update({"done": True, "encoder": pick or "mpeg4",
+                         "version": ver, "encoders": encs[:60]})
+        log(task_id, "ffmpeg 探测：%s ｜ 视频编码器=%s" % (ver or "未知", _FF_CAPS["encoder"]))
+        return dict(_FF_CAPS)
+
+
+def test_encode(task_id=None):
+    """真跑一条 2 秒 320x568 的最小视频，验证整条编码链路可用。
+
+    返回 (ok, 说明)。这是给「自检」按钮用的，也是生成前的兜底验证。
+    """
+    caps = probe_ffmpeg(task_id)
+    tmp = os.path.join(MPT_HOME, "probe_test.mp4")
+    enc = caps["encoder"] or "libx264"
+    tiers = [
+        (enc, [p for p in encode_common("fast", enc)]),
+        ("mpeg4", ["-c:v", "mpeg4", "-q:v", "4", "-pix_fmt", "yuv420p", "-r", "30",
+                   "-c:a", "aac", "-b:a", "128k"]),
+        (None, ["-c:v", "mpeg4", "-q:v", "6", "-pix_fmt", "yuv420p"]),
+    ]
+    last = ""
+    for name, params in tiers:
+        if name is None:
+            continue
+        args = ["-y", "-f", "lavfi", "-i", "testsrc=size=320x568:rate=30:duration=2",
+                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-shortest"] + params + [tmp]
+        try:
+            run_ffmpeg(args, task_id, timeout=120)
+            if os.path.isfile(tmp) and os.path.getsize(tmp) > 1000:
+                sz = os.path.getsize(tmp)
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                return True, "%s 测试编码成功（%d 字节）" % (name, sz)
+            last = "%s 输出文件为空" % name
+        except Exception as e:
+            last = "%s: %s" % (name, e)
+    return False, last or "所有编码器均测试失败"
 
 
 # --------------------------------------------------------------------------- #
@@ -773,29 +875,39 @@ def fetch_stock_clip(keyword, subject, aspect, task_dir, idx, cfg, timeout=45):
     return None
 
 
-def encode_common(quality="hd"):
-    """统一的 H.264 编码参数（均已在实际设备/标准 ffmpeg 上验证）。
+def encode_common(quality="hd", encoder=None):
+    """统一的视频编码参数，按探测到的可用编码器自适应。
 
-    hd（高清优先，默认）：veryfast + crf18，画质接近抖音短剧；
-    fast（极速）：ultrafast + crf23，弱机也能快速出片；
-    safe（兜底）：最保守参数，去掉一切可能不被设备 x264 支持的选项。
+    hd（高清优先，默认）：libx264 veryfast + crf18，画质接近抖音短剧；
+    fast（极速）：libx264 ultrafast + crf23，弱机也能快速出片；
+    safe（兜底）：去掉一切可能不被设备支持的选项。
+
+    若设备没有 libx264，自动换 h264_mediacodec（硬件）/ mpeg4（永远存在）。
+    注意：不再使用 -profile/-level/-maxrate/-g 这类「部分安卓 x264 构建会拒绝」的参数。
     """
+    enc = encoder or (_FF_CAPS.get("encoder") if _FF_CAPS.get("done") else None) or "libx264"
+    if enc == "mpeg4":
+        q = {"safe": "6", "fast": "4"}.get(quality, "3")
+        return ["-c:v", "mpeg4", "-q:v", q, "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100"]
+    if enc == "h264_mediacodec":
+        # 安卓硬件编码：码率控制用 -b:v，不吃 crf/preset
+        br = {"safe": "4M", "fast": "6M"}.get(quality, "8M")
+        return ["-c:v", "h264_mediacodec", "-b:v", br, "-pix_fmt", "yuv420p",
+                "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", "44100"]
+    # libx264
     if quality == "safe":
         return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                "-pix_fmt", "yuv420p", "-threads", "2",
+                "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "128k"]
     if quality == "fast":
         return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
-                "-threads", "2",
-                "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-                "-movflags", "+faststart"]
+                "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-b:a", "160k", "-ar", "44100"]
     # 高清优先
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-            "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
-            "-threads", "2",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
-            "-movflags", "+faststart"]
+            "-pix_fmt", "yuv420p", "-r", "30",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100"]
 
 
 def compose_online(bg_video, sub_png, audio_path, w, h, out_path, quality="hd", task_id=None):
@@ -836,7 +948,8 @@ def compose_online(bg_video, sub_png, audio_path, w, h, out_path, quality="hd", 
 def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd", task_id=None):
     """离线兜底：对字幕卡做缓慢平移缩放(Ken Burns)生成动态背景 + 配音。"""
     has_audio = bool(audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0)
-    inputs = ["-y", "-loop", "1", "-i", card_png]
+    # 显式 -f image2 -loop 1 -framerate 30：比裸 -loop 1 更明确，避免 demuxer 推断差异
+    inputs = ["-y", "-f", "image2", "-loop", "1", "-framerate", "30", "-i", card_png]
     if has_audio:
         inputs += ["-i", audio_path]
     else:
@@ -847,8 +960,9 @@ def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd", tas
     def build(q, use_vf=True):
         tail = (["-vf", vf] if use_vf else []) + encode_common(q)
         if has_audio:
+            # 按配音实际长度收尾（-shortest 取最短流），避免把语音末尾截掉
             return inputs + ["-shortest"] + tail + [out_path]
-        return inputs + ["-t", "%.2f" % dur] + tail + [out_path]
+        return inputs + ["-t", "%.2f" % max(0.6, float(dur or 3))] + tail + [out_path]
 
     # 逐级降级：高清 → 极速 → 保守 → 保守且去掉运镜（纯静图），确保一定能出片
     last = None
@@ -895,6 +1009,8 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
     segments = plan.get("segments") or []
     if not segments:
         raise RuntimeError("没有可生成的句子，请检查文案。")
+    # 先探测设备 ffmpeg 能力（版本 + 可用视频编码器），后续编码参数据此自适应
+    probe_ffmpeg(task_id)
     subject = (plan.get("script") or "").strip()
     has_stock = bool((cfg.get("pexels_api_key") or "").strip()
                      or (cfg.get("pixabay_api_key") or "").strip())
@@ -997,10 +1113,21 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
             f.write("file '%s'\n" % c.replace("'", "'\\''"))
 
     final_path = os.path.join(task_dir, "final.mp4")
-    run_ffmpeg([
-        "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-        "-c", "copy", "-movflags", "+faststart", final_path,
-    ], task_id)
+    # 拼接：优先流复制（无损、快）；若因片段编码参数不一致等原因失败，
+    # 退回「重新编码拼接」，保证一定能拼上。
+    concat_ok = False
+    try:
+        run_ffmpeg([
+            "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c", "copy", "-movflags", "+faststart", final_path,
+        ], task_id)
+        concat_ok = True
+    except Exception as e:
+        log(task_id, "无损拼接失败，改为重新编码拼接：%s" % e)
+    if not concat_ok:
+        run_ffmpeg([
+            "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+        ] + encode_common("fast") + ["-movflags", "+faststart", final_path], task_id)
 
     # 可选：叠加内置背景音乐（失败不影响成片）
     try:
@@ -1018,6 +1145,12 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
                 final_path = mixed
     except Exception as e:
         log(task_id, "背景音乐叠加跳过：%s" % e)
+
+    # 成片校验：确保文件真实存在且有内容，避免「显示完成但打不开」
+    if not (os.path.isfile(final_path) and os.path.getsize(final_path) > 10000):
+        raise RuntimeError("成片文件异常（大小 %d 字节）" %
+                           (os.path.getsize(final_path) if os.path.isfile(final_path) else 0))
+    log(task_id, "成片体积 %.1f MB" % (os.path.getsize(final_path) / 1048576.0))
 
     # 导出到手机 Download/Ai视频（含视频与文案）
     saved = export_to_downloads(task_id, final_path, subject or plan.get("script", ""))
@@ -1176,9 +1309,11 @@ UI_HTML = r"""<!DOCTYPE html>
       <div class="row">
         <button class="sec" onclick="saveConfig()">保存配置</button>
         <button class="ghost" onclick="testModel()">🔌 测试是否可用</button>
+        <button class="ghost" onclick="ffDiagnose()">🩺 视频引擎自检</button>
       </div>
       <div id="testResult" class="hint"></div>
-      <div class="hint">只需一个大模型 Key。选好模型后 Base URL 会自动填好；点「测试」用你的 Key 实测能否调通。</div>
+      <div id="ffResult" class="hint"></div>
+      <div class="hint">只需一个大模型 Key。选好模型后 Base URL 会自动填好；点「测试」用你的 Key 实测能否调通。若生成视频时报 ffmpeg 错误，点「视频引擎自检」把结果发我即可精准定位。</div>
     </div>
   </div>
 
@@ -1425,6 +1560,24 @@ async function testModel(){
   }catch(e){res.textContent='请求失败：'+e.message;}
 }
 
+// 视频引擎自检：把 ffmpeg 路径/版本/编码器 + 真实测试编码结果显示出来
+async function ffDiagnose(){
+  const res=document.getElementById('ffResult');
+  res.textContent='正在自检（首次约 10~20 秒）...';
+  try{
+    const r=await fetch(API+"/api/v1/ffprobe");
+    const j=await r.json();
+    const d=(j&&j.data)||{};
+    const lines=[];
+    lines.push('引擎：'+(d.version||'未识别'));
+    lines.push('编码器：'+(d.encoder||'未识别'));
+    lines.push('路径：'+(d.path||''));
+    lines.push((d.ok?'✅ 测试编码通过：':'❌ 测试编码失败：')+(d.detail||''));
+    res.innerHTML=lines.join('<br>');
+    if(!d.ok){alert('视频引擎自检失败：\n'+(d.detail||'未知原因'));}
+  }catch(e){res.textContent='自检请求失败：'+e.message;}
+}
+
 async function genScript(){
   const subject=document.getElementById('subject').value.trim();
   if(!subject){alert('请先填写主题');return;}
@@ -1569,6 +1722,22 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/v1/mpt_config":
             # 启动即返回已保存配置，前端据此回填表单，实现「Key 只填一次」
             self._send_json({"status": 200, "data": load_config()})
+        elif path == "/api/v1/ffprobe":
+            # 自检：ffmpeg 路径/版本/可用编码器 + 真实跑一条最小测试编码
+            try:
+                caps = probe_ffmpeg(None)
+                ok, msg = test_encode(None)
+                self._send_json({"status": 200, "data": {
+                    "path": ffmpeg_bin(),
+                    "version": caps.get("version") or "",
+                    "encoder": caps.get("encoder") or "",
+                    "ok": ok, "detail": msg,
+                }})
+            except Exception as e:
+                self._send_json({"status": 200, "data": {
+                    "path": ffmpeg_bin(), "version": "", "encoder": "",
+                    "ok": False, "detail": str(e),
+                }})
         elif path.startswith("/api/v1/tasks/"):
             self._handle_task_get(path.split("/")[-1])
         elif path.startswith("/tasks/"):
