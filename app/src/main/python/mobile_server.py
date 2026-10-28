@@ -307,6 +307,70 @@ def generate_script(subject, cfg, word_count=None):
     return text
 
 
+def _clean_llm_json(text):
+    text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text).strip()
+    m = re.search(r"\{.*\}", text, re.S)  # 模型可能夹带解释文字，只取 JSON 块
+    if m:
+        text = m.group(0)
+    return text
+
+
+def generate_plan(subject, cfg, word_count=None):
+    """生成结构化简案：{'script': 正文, 'segments':[{'text','keyword'}]}。
+
+    keyword 用于到 Pexels 等素材库检索真实视频画面；解析失败或非 JSON 时
+    自动回退为「纯文案 + 分句」（keyword 留空 → 走离线动态背景兜底）。
+    """
+    provider = (cfg.get("provider") or "openai").lower()
+    wc = None
+    try:
+        wc = int(word_count) if word_count not in (None, "", "0") else None
+    except Exception:
+        wc = None
+    sys_prompt = (
+        "你是一个短视频文案与素材策划助手。请根据主题生成一段适合配音的短视频口播文案，"
+        "并拆分成若干分句，同时为每句匹配一个用于检索视频素材的英文关键词。\n"
+        "严格只输出一个 JSON 对象，不要任何解释、不要 markdown 代码块，格式如下：\n"
+        '{"script":"口播正文（口语化、有节奏、不要分点、不要括号里的动作提示）",'
+        '"segments":[{"text":"单句文案","keyword":"english search keyword for footage, e.g. city traffic"}]}\n'
+        "要求：script 由 segments 的 text 按顺序自然拼接而成；"
+        "keyword 简短具体、用英文（便于在素材库命中对应画面）；中文主题用中文写 script，但 keyword 用英语。"
+    )
+    if wc and wc > 0:
+        wc = max(50, min(2000, wc))
+        sys_prompt += (
+            " script 正文严格控制在 %d 字左右（按中文字符数计），内容要充实连贯。" % wc
+        )
+    try:
+        text = chat_complete(provider, cfg, [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": "主题：%s" % subject},
+        ])
+        obj = json.loads(_clean_llm_json(text))
+        script = (obj.get("script") or "").strip()
+        segs = obj.get("segments") or []
+        segments = []
+        for s in segs:
+            t = (s.get("text") or "").strip()
+            if not t:
+                continue
+            kw = (s.get("keyword") or "").strip()
+            segments.append({"text": t, "keyword": kw})
+        if not script and segments:
+            script = " ".join(x["text"] for x in segments)
+        if not segments and script:
+            segments = [{"text": s, "keyword": ""} for s in split_sentences(script)]
+        if not script or not segments:
+            raise ValueError("解析为空")
+        return {"script": script, "segments": segments}
+    except Exception as e:
+        print("generate_plan 解析失败，回退纯文本分句：%s" % e, flush=True)
+        plain = generate_script(subject, cfg, word_count)
+        segments = [{"text": s, "keyword": ""} for s in split_sentences(plain)]
+        return {"script": plain, "segments": segments}
+
+
 # --------------------------------------------------------------------------- #
 # 配音（edge-tts，微软在线 TTS）
 # --------------------------------------------------------------------------- #
@@ -542,6 +606,136 @@ def render_frame(text, w, h, idx, total, seed=0):
 
 
 # --------------------------------------------------------------------------- #
+# 素材获取（Pexels 真实视频 + 离线动态背景）与片段合成
+# --------------------------------------------------------------------------- #
+def render_subtitle_png(text, w, h):
+    """渲染透明背景 + 半透明底栏 + 居中描边白字，用于叠加到真实视频素材上。"""
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = load_font(int(h * 0.055))
+    max_w = int(w * 0.86)
+    lines = wrap_cjk(text, font, max_w)
+    line_h = int(font.size * 1.4)
+    total_h = line_h * len(lines)
+    y0 = int((h - total_h) / 2)
+    # 半透明底栏提升在真实画面上的可读性
+    bar_h = total_h + int(h * 0.06)
+    bar_y = int((h - bar_h) / 2)
+    draw.rectangle([0, bar_y, w, bar_y + bar_h], fill=(0, 0, 0, 110))
+    y = y0
+    for line in lines:
+        lw = font.getlength(line)
+        x = (w - lw) / 2
+        draw.text((x, y), line, font=font, fill=(255, 255, 255),
+                  stroke_width=max(2, int(font.size * 0.02)), stroke_fill=(0, 0, 0))
+        y += line_h
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def fetch_pexels_clip(keyword, subject, aspect, task_dir, idx, api_key, timeout=45):
+    """按关键词从 Pexels 拉一段真实视频；失败 / 无 Key 返回 None（走离线兜底）。"""
+    if not api_key:
+        return None
+    orientation = "portrait" if aspect == "9:16" else ("landscape" if aspect == "16:9" else "square")
+    headers = {"Authorization": api_key}
+    for q in [keyword, subject]:  # 关键词命中不到时退而用主题词再试
+        q = (q or "").strip()
+        if not q:
+            continue
+        try:
+            r = requests.get("https://api.pexels.com/videos/search", headers=headers,
+                             params={"query": q, "per_page": 10, "orientation": orientation}, timeout=15)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            cands = []
+            for v in data.get("videos", []):
+                for vf in v.get("video_files", []):
+                    link = vf.get("link")
+                    vw = vf.get("width") or 0
+                    vh = vf.get("height") or 0
+                    if link and vw > 0 and vh > 0:
+                        cands.append((vw, vh, link))
+            if not cands:
+                continue
+            cands.sort(key=lambda x: x[0])
+            pick = None
+            for c in cands:  # 优先选 480~1280 宽，体积小、解码快
+                if 480 <= c[0] <= 1280:
+                    pick = c
+                    break
+            if not pick:
+                pick = cands[len(cands) // 2]
+            out = os.path.join(task_dir, "bg_%03d.mp4" % idx)
+            dr = requests.get(pick[2], headers=headers, timeout=timeout, stream=True)
+            dr.raise_for_status()
+            with open(out, "wb") as f:
+                for chunk in dr.iter_content(65536):
+                    if chunk:
+                        f.write(chunk)
+            if os.path.getsize(out) < 5000:
+                try:
+                    os.remove(out)
+                except Exception:
+                    pass
+                continue
+            return out
+        except Exception as e:
+            print("pexels fetch(%s) 失败：%s" % (q, e), flush=True)
+            continue
+    return None
+
+
+def compose_online(bg_video, sub_png, audio_path, w, h, out_path):
+    """在线：真实视频素材缩放裁剪铺满 → 叠加透明字幕 → 混入配音。"""
+    has_audio = bool(audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0)
+    inputs = ["-y", "-stream_loop", "-1", "-i", bg_video]
+    if sub_png:
+        inputs += ["-i", sub_png]
+    if has_audio:
+        inputs += ["-i", audio_path]
+    else:
+        inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+    aid = 2 if sub_png else 1
+    fc = "[0:v]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d[bg]" % (w, h, w, h)
+    if sub_png:
+        fc += ";[bg][1:v]overlay=0:0[v]"
+        vmap = "[v]"
+    else:
+        vmap = "[bg]"
+    common = ["-filter_complex", fc, "-map", vmap, "-map", "%d:a" % aid,
+              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+              "-pix_fmt", "yuv420p", "-r", "25", "-threads", "2",
+              "-c:a", "aac", "-b:a", "128k", out_path]
+    if has_audio:
+        run_ffmpeg(inputs + ["-shortest"] + common)
+    else:
+        run_ffmpeg(inputs + ["-t", "8.0"] + common)
+
+
+def compose_offline(card_png, audio_path, w, h, dur, out_path):
+    """离线兜底：对字幕卡做缓慢平移缩放(Ken Burns)生成动态背景 + 配音。"""
+    has_audio = bool(audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0)
+    inputs = ["-y", "-loop", "1", "-i", card_png]
+    if has_audio:
+        inputs += ["-i", audio_path]
+    else:
+        inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+    vf = ("scale='iw*1.12':'ih*1.12',"
+          "crop=%d:%d:x='(iw-%d)/2+18*sin(t*0.35)':y='(ih-%d)/2+14*cos(t*0.28)'" % (w, h, w, h))
+    common = ["-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+              "-pix_fmt", "yuv420p", "-r", "25", "-threads", "2",
+              "-c:a", "aac", "-b:a", "128k", out_path]
+    if has_audio:
+        run_ffmpeg(inputs + ["-shortest"] + common)
+    else:
+        run_ffmpeg(inputs + ["-t", "%.2f" % dur] + common)
+
+
+# --------------------------------------------------------------------------- #
 # 视频合成（直接调 ffmpeg）
 # --------------------------------------------------------------------------- #
 def split_sentences(text):
@@ -562,105 +756,106 @@ def split_sentences(text):
     return out
 
 
-def build_video(task_id, script, voice, aspect, cfg, duration_sec=0):
-    sentences = split_sentences(script)
-    if not sentences:
+def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0):
+    """用「真实视频素材 + 字幕 + 配音」合成真短视频。
+
+    plan = {'script': 正文, 'segments':[{'text','keyword'}]}
+    每个 segment：优先用 Pexels 真实视频作背景并叠加透明字幕；无 Key/联网失败
+    则退化为本地字幕卡做 Ken Burns 动态背景（离线，仍是动态画面而非死图）。
+    """
+    segments = plan.get("segments") or []
+    if not segments:
         raise RuntimeError("没有可生成的句子，请检查文案。")
+    subject = (plan.get("script") or "").strip()
+    pexels_key = (cfg.get("pexels_api_key") or "").strip()
 
     res = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
     w, h = res.get(aspect, (1080, 1920))
-
     lang = gtts_lang(voice)
-    # 时长控制：用户指定分钟数 → 视频总时长 ≈ duration_sec
-    # - 文案自然时长不足：循环文案把时长凑到指定值（配音不被截断）
-    # - 文案已够长：均分各句到指定总时长（超出部分截断静音）
-    # 关键：配音只对「原始句子」生成一次，循环时复用音频，避免重复网络请求。
-    seg_per = None
+    n_orig = len(segments)
+
+    # 时长控制：文案自然时长不足时循环整段凑到目标；不拉伸音频，保证口播自然。
+    natural = sum(estimate_duration(s["text"], lang) for s in segments)
     reps = 1
     if duration_sec and duration_sec > 0:
-        natural = sum(max(estimate_duration(s, lang), 1.5) * 2 for s in sentences)
         if natural < duration_sec - 2:
             reps = max(1, int(math.ceil(duration_sec / max(natural, 1))))
-            seg_per = duration_sec / (len(sentences) * reps)
-        else:
-            seg_per = duration_sec / len(sentences)
+    total = n_orig * reps
 
     task_dir = os.path.join(MPT_HOME, "tasks", task_id)
     os.makedirs(task_dir, exist_ok=True)
 
-    # 1) 仅为「原始句子」生成素材（图片+配音），并发生成以掩盖网络延迟
-    originals = sentences[:]
-    n_orig = len(originals)
-    assets = [None] * n_orig
+    # 1) 为每个原始 segment 并行准备：配音 + 真实素材(或离线卡) + 字幕
+    prep = [None] * n_orig
 
-    def make_asset(i, sent):
-        png_path = os.path.join(task_dir, "frame_%03d.png" % i)
-        with open(png_path, "wb") as f:
-            f.write(render_frame(sent, w, h, i, n_orig, seed=0))
+    def prep_segment(i):
+        seg = segments[i]
+        text = seg["text"]
         audio_path = os.path.join(task_dir, "audio_%03d.mp3" % i)
-        dur = tts_to_file(sent, voice, audio_path)
-        if dur is None:
-            log(task_id, "⚠ 第%d句配音失败（edge-tts 不可用？），该句将以静音兜底" % (i + 1))
-        assets[i] = (png_path, audio_path, dur, sent)
+        adur = tts_to_file(text, voice, audio_path)
+        if adur is None:
+            log(task_id, "⚠ 第%d句配音失败（edge-tts 不可用？），静音兜底" % (i + 1))
+        bg = None
+        if pexels_key:
+            bg = fetch_pexels_clip(seg.get("keyword") or "", subject, aspect, task_dir, i, pexels_key)
+        if bg:
+            sub_path = os.path.join(task_dir, "sub_%03d.png" % i)
+            with open(sub_path, "wb") as f:
+                f.write(render_subtitle_png(text, w, h))
+            prep[i] = {"mode": "online", "bg": bg, "sub": sub_path, "audio": audio_path, "adur": adur}
+        else:
+            card_path = os.path.join(task_dir, "frame_%03d.png" % i)
+            with open(card_path, "wb") as f:
+                f.write(render_frame(text, w, h, i, n_orig, seed=0))
+            prep[i] = {"mode": "offline", "card": card_path, "audio": audio_path, "adur": adur}
 
-    log(task_id, "并行生成 %d 句素材（图片+配音）..." % n_orig)
+    if not pexels_key:
+        log(task_id, "未配置 Pexels Key，使用离线动态背景（纯本地、无需联网）；配置后可拉真实视频画面")
+    log(task_id, "并行准备 %d 个片段（配音 + 素材）..." % n_orig)
     done_a = 0
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futs_a = {ex.submit(make_asset, i, originals[i]): i for i in range(n_orig)}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs_a = {ex.submit(prep_segment, i): i for i in range(n_orig)}
         for fut in as_completed(futs_a):
             fut.result()
             done_a += 1
             with TASKS_LOCK:
-                TASKS[task_id]["progress"] = int((done_a / n_orig) * 55)
+                TASKS[task_id]["progress"] = int((done_a / n_orig) * 45)
 
-    # 2) 为每个「原始句子」编码一个 clip（去重：循环文案时复用同一 clip，不重复编码）
-    def clip_seg_of(asset):
-        _, _, dur, sent = asset
-        if seg_per:
-            return max(1.0, seg_per)
-        return estimate_duration(sent, lang) if dur is None else dur * 2
-
-    def encode_asset(i):
-        png_path, audio_path, dur, sent = assets[i]
-        seg = clip_seg_of(assets[i])
+    # 2) 为每个原始 segment 编码成一个 clip（去重：reps 循环时复用同一 clip）
+    def encode_segment(i):
+        p = prep[i]
+        adur = p["adur"]
+        dur = max(estimate_duration(segments[i]["text"], lang), 1.5) if adur is None else adur
         clip_path = os.path.join(task_dir, "clip_%03d.mp4" % i)
-        # -crf 20 保证高清；-r 20 静态画面够流畅；-threads 2 防止压垮手机
-        if dur is None:
-            run_ffmpeg([
-                "-y", "-loop", "1", "-i", png_path,
-                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-t", "%.2f" % seg,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-                "-pix_fmt", "yuv420p", "-r", "20", "-threads", "2",
-                "-c:a", "aac", "-b:a", "128k", "-shortest", clip_path,
-            ], task_id)
-        else:
-            run_ffmpeg([
-                "-y", "-loop", "1", "-i", png_path, "-i", audio_path,
-                "-t", "%.2f" % seg,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-                "-pix_fmt", "yuv420p", "-r", "20", "-threads", "2",
-                "-c:a", "aac", "-b:a", "128k", "-af", "apad", "-shortest", clip_path,
-            ], task_id)
+        try:
+            if p["mode"] == "online":
+                compose_online(p["bg"], p["sub"], p["audio"], w, h, clip_path)
+            else:
+                compose_offline(p["card"], p["audio"], w, h, dur, clip_path)
+        except Exception as e:
+            # 真实素材解码失败等 → 退回离线动态背景，保证出片
+            log(task_id, "片段%d 合成失败，退回离线背景：%s" % (i + 1, e))
+            card_path = os.path.join(task_dir, "frame_%03d.png" % i)
+            if not (os.path.isfile(card_path) and os.path.getsize(card_path) > 0):
+                with open(card_path, "wb") as f:
+                    f.write(render_frame(segments[i]["text"], w, h, i, n_orig, seed=0))
+            compose_offline(card_path, p["audio"], w, h, dur, clip_path)
         return clip_path
 
-    log(task_id, "并发编码 %d 个片段（已去重，循环文案只编码原始句）..." % n_orig)
-    asset_clips = [None] * n_orig
+    log(task_id, "并发编码 %d 个片段..." % n_orig)
+    clips = [None] * n_orig
     done_c = 0
     with ThreadPoolExecutor(max_workers=4) as ex:
-        futs_c = {ex.submit(encode_asset, i): i for i in range(n_orig)}
+        futs_c = {ex.submit(encode_segment, i): i for i in range(n_orig)}
         for fut in as_completed(futs_c):
             i = futs_c[fut]
-            asset_clips[i] = fut.result()
+            clips[i] = fut.result()
             done_c += 1
             with TASKS_LOCK:
-                TASKS[task_id]["progress"] = 55 + int((done_c / n_orig) * 30)
+                TASKS[task_id]["progress"] = 45 + int((done_c / n_orig) * 40)
 
-    # 3) 按 reps 展开最终序列（去重引用同一 clip 文件，避免重复编码）
-    seq_clip_paths = [asset_clips[k % n_orig] for k in range(n_orig * reps)]
-    total = len(seq_clip_paths)
-
-    # 拼接（复制流，不重编码，极快）
+    # 3) 按 reps 展开最终序列（复用同一 clip 文件，避免重复编码）
+    seq_clip_paths = [clips[k % n_orig] for k in range(total)]
     log(task_id, "拼接 %d 个片段..." % total)
     with TASKS_LOCK:
         TASKS[task_id]["progress"] = 85
@@ -692,7 +887,7 @@ def build_video(task_id, script, voice, aspect, cfg, duration_sec=0):
         log(task_id, "背景音乐叠加跳过：%s" % e)
 
     # 导出到手机 Download/Ai视频（含视频与文案）
-    saved = export_to_downloads(task_id, final_path, script)
+    saved = export_to_downloads(task_id, final_path, subject or plan.get("script", ""))
 
     with TASKS_LOCK:
         TASKS[task_id]["progress"] = 100
@@ -741,23 +936,23 @@ def pick_background_music():
 # --------------------------------------------------------------------------- #
 # 任务调度
 # --------------------------------------------------------------------------- #
-def create_task(script, voice, aspect, cfg, duration_sec=0):
+def create_task(plan, voice, aspect, cfg, duration_sec=0):
     task_id = uuid.uuid4().hex[:12]
     with TASKS_LOCK:
         TASKS[task_id] = {
             "state": 0, "progress": 0, "videos": [], "error": "", "logs": [],
         }
     t = threading.Thread(
-        target=_run_task, args=(task_id, script, voice, aspect, cfg, duration_sec),
+        target=_run_task, args=(task_id, plan, voice, aspect, cfg, duration_sec),
         daemon=True,
     )
     t.start()
     return task_id
 
 
-def _run_task(task_id, script, voice, aspect, cfg, duration_sec=0):
+def _run_task(task_id, plan, voice, aspect, cfg, duration_sec=0):
     try:
-        build_video(task_id, script, voice, aspect, cfg, duration_sec)
+        build_video(task_id, plan, voice, aspect, cfg, duration_sec)
     except Exception as e:
         tb = traceback.format_exc()
         log(task_id, "任务失败：%s" % e)
@@ -840,6 +1035,9 @@ UI_HTML = r"""<!DOCTYPE html>
       <select id="modelName"></select>
       <label>自定义模型名（本地模型必填，留空则用上方所选）</label>
       <input id="modelCustom" type="text" placeholder="例如 qwen2.5:7b / llama3.1:8b / deepseek-r1:7b">
+      <label>Pexels Key（真实视频素材，可选·免费）</label>
+      <input id="pexelsKey" type="text" placeholder="去 pexels.com/api 免费申请；留空则用离线动态背景">
+      <div class="hint">填了 Pexels Key：每句文案会去 Pexels 拉<b>真实视频画面</b>做背景（效果最像抖音短视频）。不填也能用——自动用本地字幕卡的动态背景（Ken Burns），纯离线、无需联网。</div>
       <div class="row">
         <button class="sec" onclick="saveConfig()">保存配置</button>
         <button class="ghost" onclick="testModel()">🔌 测试是否可用</button>
@@ -987,6 +1185,7 @@ async function loadSavedConfig(){
     onProviderChange(); // 重建模型列表 + 设默认 Base URL
     if(c.base_url) document.getElementById('baseUrl').value=c.base_url;
     if(c.api_key) document.getElementById('apiKey').value=c.api_key;
+    if(c.pexels_api_key) document.getElementById('pexelsKey').value=c.pexels_api_key;
     if(c.model_name){
       const m=document.getElementById('modelName');
       if(![...m.options].some(o=>o.value===c.model_name)){
@@ -1049,7 +1248,8 @@ async function saveConfig(){
     provider:document.getElementById('provider').value,
     api_key:document.getElementById('apiKey').value.trim(),
     base_url:document.getElementById('baseUrl').value.trim(),
-    model_name:custom||document.getElementById('modelName').value.trim()
+    model_name:custom||document.getElementById('modelName').value.trim(),
+    pexels_api_key:document.getElementById('pexelsKey').value.trim()
   };
   try{
     const r=await fetch(API+"/api/v1/mpt_config",{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -1083,14 +1283,15 @@ async function genScript(){
   const subject=document.getElementById('subject').value.trim();
   if(!subject){alert('请先填写主题');return;}
   const wc=document.getElementById('wordCount').value.trim();
-  log('正在生成文案...');
+  log('正在生成文案（含素材关键词）...');
   try{
-    const r=await fetch(API+"/api/v1/scripts",{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch(API+"/api/v1/plan",{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({video_subject:subject, word_count:wc})});
     const j=await r.json();
-    if(j && j.data && j.data.video_script){
-      document.getElementById('script').value=j.data.video_script;
-      log('文案已生成 ✅');
+    if(j && j.data && j.data.script){
+      window.curPlan=j.data;
+      document.getElementById('script').value=j.data.script;
+      log('文案已生成 ✅（'+((j.data.segments||[]).length)+' 句，已配素材关键词）');
     }else{
       log('生成失败：'+(j.message||JSON.stringify(j)));
       alert('文案生成失败：'+(j.message||''));
@@ -1107,11 +1308,16 @@ async function genVideo(){
   document.getElementById('progressBox').style.display='block';
   setBadge('', '');
   log('正在创建视频任务...');
+  // 若未改文案，则带上结构化简案（含素材关键词），让 Pexels 真实素材生效
+  let segments=null;
+  if(window.curPlan && window.curPlan.script===script && window.curPlan.segments){
+    segments=window.curPlan.segments;
+  }
   try{
     const r=await fetch(API+"/api/v1/videos",{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         video_subject:subject||" ", video_script:script,
-        video_aspect:document.getElementById('aspect').value,
+        segments:segments, video_aspect:document.getElementById('aspect').value,
         voice_name:document.getElementById('voice').value,
         duration_min:document.getElementById('durationMin').value
       })});
@@ -1245,6 +1451,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg["api_key"] = (body.get("api_key") or "").strip()
             cfg["base_url"] = (body.get("base_url") or "").strip()
             cfg["model_name"] = (body.get("model_name") or "").strip()
+            cfg["pexels_api_key"] = (body.get("pexels_api_key") or "").strip()
             save_config(cfg)
             self._send_json({"status": 200, "message": "saved"})
 
@@ -1264,20 +1471,51 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"status": 500, "message": "生成失败：%s" % e})
 
+        elif path == "/api/v1/plan":
+            cfg = load_config()
+            subject = (body.get("video_subject") or "").strip()
+            word_count = body.get("word_count")
+            if not subject:
+                self._send_json({"status": 400, "message": "缺少主题"}, 400)
+                return
+            if not cfg.get("api_key") and provider_needs_key(cfg.get("provider")):
+                self._send_json({"status": 400, "message": "请先在「配置」中填写 API Key"}, 400)
+                return
+            try:
+                plan = generate_plan(subject, cfg, word_count)
+                self._send_json({"status": 200, "data": plan})
+            except Exception as e:
+                self._send_json({"status": 500, "message": "生成失败：%s" % e})
+
         elif path == "/api/v1/videos":
             cfg = load_config()
             script = (body.get("video_script") or "").strip()
             subject = (body.get("video_subject") or "").strip()
-            if not script:
+            word_count = body.get("word_count")
+            seg_in = body.get("segments") or []
+            if seg_in and isinstance(seg_in, list) and len(seg_in) > 0:
+                # 前端传回结构化简案（含关键词）：优先使用，保证 Pexels 真实素材生效
+                segs = []
+                for s in seg_in:
+                    t = (s.get("text") or "").strip()
+                    if t:
+                        segs.append({"text": t, "keyword": (s.get("keyword") or "").strip()})
+                if not segs:
+                    segs = [{"text": s, "keyword": ""} for s in split_sentences(script)]
+                plan = {"script": script or " ".join(x["text"] for x in segs), "segments": segs}
+            elif not script:
                 if subject and (cfg.get("api_key") or not provider_needs_key(cfg.get("provider"))):
                     try:
-                        script = generate_script(subject, cfg)
+                        plan = generate_plan(subject, cfg, word_count)
                     except Exception as e:
                         self._send_json({"status": 500, "message": "文案生成失败：%s" % e})
                         return
                 else:
                     self._send_json({"status": 400, "message": "请先填写文案或主题(并配置Key)"}, 400)
                     return
+            else:
+                # 用户手填文案：按句拆分，无关键词 → 走离线背景兜底
+                plan = {"script": script, "segments": [{"text": s, "keyword": ""} for s in split_sentences(script)]}
             if not cfg.get("api_key") and provider_needs_key(cfg.get("provider")):
                 self._send_json({"status": 400, "message": "请先配置 API Key"}, 400)
                 return
@@ -1290,7 +1528,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 duration_min = 0
             duration_sec = int(max(0, min(10, duration_min)) * 60)
-            task_id = create_task(script, voice, aspect, cfg, duration_sec)
+            task_id = create_task(plan, voice, aspect, cfg, duration_sec)
             self._send_json({"status": 200, "data": {"task_id": task_id}})
 
         elif path == "/api/v1/test":
