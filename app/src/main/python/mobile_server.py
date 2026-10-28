@@ -215,6 +215,7 @@ def load_config():
         "base_url": "",
         "model_name": "",
         "pexels_api_key": "",
+        "pixabay_api_key": "",
     }
     try:
         if CONFIG_PATH and os.path.isfile(CONFIG_PATH):
@@ -566,19 +567,25 @@ def get_bg(w, h):
 
 
 def render_frame(text, w, h, idx, total, seed=0):
-    """在缓存渐变背景上叠加底部字幕条与居中字幕，返回 PNG 字节。"""
-    base = get_bg(w, h).convert("RGB").convert("RGBA")
-    img = base
-    draw = ImageDraw.Draw(img)
-    draw_caption(draw, text, w, h)
+    """在缓存渐变背景上叠加底部字幕条与居中字幕，返回不透明 RGB PNG 字节。
 
-    # 进度点
+    字幕条画在独立透明层再 alpha 合成到不透明底图上，保证半透明效果正确、
+    且输出为无 alpha 通道的普通 RGB 图（兼容性最好，ffmpeg 解码最稳）。
+    """
+    base = get_bg(w, h).convert("RGB")
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    draw_caption(od, text, w, h)
+
+    # 进度点（画在上层，同样走 alpha 合成）
     dot_y = int(h * 0.92)
     gap = 22
     start_x = int(w / 2 - (total - 1) * gap / 2)
     for i in range(total):
-        color = (255, 255, 255) if i == idx else (120, 120, 120)
-        draw.ellipse([start_x + i * gap - 5, dot_y - 5, start_x + i * gap + 5, dot_y + 5], fill=color)
+        color = (255, 255, 255, 255) if i == idx else (120, 120, 120, 255)
+        od.ellipse([start_x + i * gap - 5, dot_y - 5, start_x + i * gap + 5, dot_y + 5], fill=color)
+
+    img = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
 
     import io
     buf = io.BytesIO()
@@ -689,12 +696,94 @@ def fetch_pexels_clip(keyword, subject, aspect, task_dir, idx, api_key, timeout=
     return None
 
 
-def encode_common(quality="hd"):
-    """统一的 H.264 编码参数。
+def _pick_hd(cands):
+    """从 (w,h,link) 候选里挑 1080p+ 高清、且体积最友好的一档。"""
+    if not cands:
+        return None
+    hd = [c for c in cands if c[1] >= 1080]
+    if hd:
+        hd.sort(key=lambda x: x[1])
+        return hd[0]
+    cands = sorted(cands, key=lambda x: x[1], reverse=True)
+    return cands[0]
 
-    hd（高清优先，默认）：veryfast + crf18 + High profile + 码率上限 10M，
-      画面接近抖音短剧；fast（极速）：ultrafast + crf23，弱机也能快速出片。
+
+def _download(url, out, headers=None, timeout=45):
+    dr = requests.get(url, headers=headers or {}, timeout=timeout, stream=True)
+    dr.raise_for_status()
+    with open(out, "wb") as f:
+        for chunk in dr.iter_content(65536):
+            if chunk:
+                f.write(chunk)
+    if os.path.getsize(out) < 5000:
+        raise RuntimeError("素材文件过小（可能非视频）")
+
+
+def fetch_pixabay_clip(keyword, subject, aspect, task_dir, idx, api_key, timeout=45):
+    """按关键词从 Pixabay 拉一段真实高清视频（Pexels 的免费替代源）。失败返回 None。"""
+    if not api_key:
+        return None
+    ori = "vertical" if aspect == "9:16" else ("horizontal" if aspect == "16:9" else "all")
+    for q in [keyword, subject]:  # 关键词命中不到时用主题词再试
+        q = (q or "").strip()
+        if not q:
+            continue
+        try:
+            r = requests.get("https://pixabay.com/api/videos/",
+                             params={"key": api_key, "q": q, "per_page": 10,
+                                     "safesearch": "true", "video_type": "film",
+                                     "orientation": ori},
+                             timeout=15)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            cands = []
+            for v in data.get("hits", []):
+                vids = v.get("videos") or {}
+                for k in ("large", "medium", "small"):
+                    it = vids.get(k) or {}
+                    link = it.get("url")
+                    vw = it.get("width") or 0
+                    vh = it.get("height") or 0
+                    if link and vw > 0 and vh > 0:
+                        cands.append((vw, vh, link))
+            pick = _pick_hd(cands)
+            if not pick:
+                continue
+            out = os.path.join(task_dir, "bg_%03d.mp4" % idx)
+            _download(pick[2], out, timeout=timeout)
+            return out
+        except Exception as e:
+            print("pixabay fetch(%s) 失败：%s" % (q, e), flush=True)
+            continue
+    return None
+
+
+def fetch_stock_clip(keyword, subject, aspect, task_dir, idx, cfg, timeout=45):
+    """按优先级依次尝试 Pexels → Pixabay，拿到一段高清真实视频，否则 None。"""
+    sources = [
+        ((cfg.get("pexels_api_key") or "").strip(), fetch_pexels_clip),
+        ((cfg.get("pixabay_api_key") or "").strip(), fetch_pixabay_clip),
+    ]
+    for key, fn in sources:
+        if key:
+            p = fn(keyword, subject, aspect, task_dir, idx, key, timeout)
+            if p:
+                return p
+    return None
+
+
+def encode_common(quality="hd"):
+    """统一的 H.264 编码参数（均已在实际设备/标准 ffmpeg 上验证）。
+
+    hd（高清优先，默认）：veryfast + crf18，画质接近抖音短剧；
+    fast（极速）：ultrafast + crf23，弱机也能快速出片；
+    safe（兜底）：最保守参数，去掉一切可能不被设备 x264 支持的选项。
     """
+    if quality == "safe":
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-threads", "2",
+                "-c:a", "aac", "-b:a", "128k"]
     if quality == "fast":
         return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
@@ -703,15 +792,13 @@ def encode_common(quality="hd"):
                 "-movflags", "+faststart"]
     # 高清优先
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-            "-profile:v", "high", "-level", "4.0",
             "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
-            "-maxrate", "10M", "-bufsize", "20M",
             "-threads", "2",
             "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
             "-movflags", "+faststart"]
 
 
-def compose_online(bg_video, sub_png, audio_path, w, h, out_path, quality="hd"):
+def compose_online(bg_video, sub_png, audio_path, w, h, out_path, quality="hd", task_id=None):
     """在线：真实视频素材缩放裁剪铺满 → 叠加透明字幕 → 混入配音。"""
     has_audio = bool(audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0)
     inputs = ["-y", "-stream_loop", "-1", "-i", bg_video]
@@ -728,14 +815,25 @@ def compose_online(bg_video, sub_png, audio_path, w, h, out_path, quality="hd"):
         vmap = "[v]"
     else:
         vmap = "[bg]"
-    common = ["-filter_complex", fc, "-map", vmap, "-map", "%d:a" % aid] + encode_common(quality)
-    if has_audio:
-        run_ffmpeg(inputs + ["-shortest"] + common)
-    else:
-        run_ffmpeg(inputs + ["-t", "8.0"] + common)
+
+    def build(q):
+        common = ["-filter_complex", fc, "-map", vmap, "-map", "%d:a" % aid] + encode_common(q)
+        if has_audio:
+            return inputs + ["-shortest"] + common + [out_path]
+        return inputs + ["-t", "8.0"] + common + [out_path]
+
+    last = None
+    for q in (quality, "fast", "safe"):
+        try:
+            run_ffmpeg(build(q), task_id)
+            return
+        except Exception as e:
+            last = e
+            log(task_id, "在线编码[%s]失败，重试更稳参数：%s" % (q, e))
+    raise last or RuntimeError("在线合成失败")
 
 
-def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd"):
+def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd", task_id=None):
     """离线兜底：对字幕卡做缓慢平移缩放(Ken Burns)生成动态背景 + 配音。"""
     has_audio = bool(audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0)
     inputs = ["-y", "-loop", "1", "-i", card_png]
@@ -745,11 +843,24 @@ def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd"):
         inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
     vf = ("scale='iw*1.12':'ih*1.12',"
           "crop=%d:%d:x='(iw-%d)/2+18*sin(t*0.35)':y='(ih-%d)/2+14*cos(t*0.28)'" % (w, h, w, h))
-    common = ["-vf", vf] + encode_common(quality)
-    if has_audio:
-        run_ffmpeg(inputs + ["-shortest"] + common)
-    else:
-        run_ffmpeg(inputs + ["-t", "%.2f" % dur] + common)
+
+    def build(q, use_vf=True):
+        tail = (["-vf", vf] if use_vf else []) + encode_common(q)
+        if has_audio:
+            return inputs + ["-shortest"] + tail + [out_path]
+        return inputs + ["-t", "%.2f" % dur] + tail + [out_path]
+
+    # 逐级降级：高清 → 极速 → 保守 → 保守且去掉运镜（纯静图），确保一定能出片
+    last = None
+    for q, use_vf in ((quality, True), ("fast", True), ("safe", True), ("safe", False)):
+        try:
+            run_ffmpeg(build(q, use_vf), task_id)
+            return
+        except Exception as e:
+            last = e
+            log(task_id, "离线编码[%s%s]失败，降级重试：%s"
+                % (q, "" if use_vf else "·无运镜", e))
+    raise last or RuntimeError("离线合成失败")
 
 
 # --------------------------------------------------------------------------- #
@@ -785,7 +896,8 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
     if not segments:
         raise RuntimeError("没有可生成的句子，请检查文案。")
     subject = (plan.get("script") or "").strip()
-    pexels_key = (cfg.get("pexels_api_key") or "").strip()
+    has_stock = bool((cfg.get("pexels_api_key") or "").strip()
+                     or (cfg.get("pixabay_api_key") or "").strip())
     if quality not in ("hd", "fast"):
         quality = "hd"
 
@@ -816,8 +928,8 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
         if adur is None:
             log(task_id, "⚠ 第%d句配音失败（edge-tts 不可用？），静音兜底" % (i + 1))
         bg = None
-        if pexels_key:
-            bg = fetch_pexels_clip(seg.get("keyword") or "", subject, aspect, task_dir, i, pexels_key)
+        if has_stock:
+            bg = fetch_stock_clip(seg.get("keyword") or "", subject, aspect, task_dir, i, cfg)
         if bg:
             sub_path = os.path.join(task_dir, "sub_%03d.png" % i)
             with open(sub_path, "wb") as f:
@@ -829,8 +941,8 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
                 f.write(render_frame(text, w, h, i, n_orig, seed=0))
             prep[i] = {"mode": "offline", "card": card_path, "audio": audio_path, "adur": adur}
 
-    if not pexels_key:
-        log(task_id, "未配置 Pexels Key，使用离线动态背景（纯本地、无需联网）；配置后可拉真实视频画面")
+    if not has_stock:
+        log(task_id, "未配置 Pexels/Pixabay Key，使用离线动态背景（纯本地、无需联网）；配置后可拉真实高清画面")
     log(task_id, "并行准备 %d 个片段（配音 + 素材）..." % n_orig)
     done_a = 0
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -849,9 +961,9 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
         clip_path = os.path.join(task_dir, "clip_%03d.mp4" % i)
         try:
             if p["mode"] == "online":
-                compose_online(p["bg"], p["sub"], p["audio"], w, h, clip_path, quality)
+                compose_online(p["bg"], p["sub"], p["audio"], w, h, clip_path, quality, task_id)
             else:
-                compose_offline(p["card"], p["audio"], w, h, dur, clip_path, quality)
+                compose_offline(p["card"], p["audio"], w, h, dur, clip_path, quality, task_id)
         except Exception as e:
             # 真实素材解码失败等 → 退回离线动态背景，保证出片
             log(task_id, "片段%d 合成失败，退回离线背景：%s" % (i + 1, e))
@@ -859,7 +971,7 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
             if not (os.path.isfile(card_path) and os.path.getsize(card_path) > 0):
                 with open(card_path, "wb") as f:
                     f.write(render_frame(segments[i]["text"], w, h, i, n_orig, seed=0))
-            compose_offline(card_path, p["audio"], w, h, dur, clip_path, quality)
+            compose_offline(card_path, p["audio"], w, h, dur, clip_path, quality, task_id)
         return clip_path
 
     log(task_id, "并发编码 %d 个片段..." % n_orig)
@@ -1056,9 +1168,11 @@ UI_HTML = r"""<!DOCTYPE html>
       <select id="modelName"></select>
       <label>自定义模型名（本地模型必填，留空则用上方所选）</label>
       <input id="modelCustom" type="text" placeholder="例如 qwen2.5:7b / llama3.1:8b / deepseek-r1:7b">
-      <label>Pexels Key（真实视频素材，可选·免费）</label>
-      <input id="pexelsKey" type="text" placeholder="去 pexels.com/api 免费申请；留空则用离线动态背景">
-      <div class="hint">填了 Pexels Key：每句文案会去 Pexels 拉<b>真实视频画面</b>做背景（效果最像抖音短视频）。不填也能用——自动用本地字幕卡的动态背景（Ken Burns），纯离线、无需联网。</div>
+      <label>Pixabay Key（真实高清视频，推荐·免费）</label>
+      <input id="pixabayKey" type="text" placeholder="去 pixabay.com/api/docs/ 免费申请；留空则用离线动态背景">
+      <label>Pexels Key（备选素材源，可留空）</label>
+      <input id="pexelsKey" type="text" placeholder="去 pexels.com/api 免费申请；被暂停可改用上面的 Pixabay">
+      <div class="hint">填了 <b>Pixabay 或 Pexels</b> 任一 Key：每句文案会去拉<b>真实高清视频</b>做背景（最像抖音短剧）。两者都填时优先 Pexels、失败自动切 Pixabay。都不填也能用——用本地字幕卡的动态背景（Ken Burns），纯离线、无需联网。</div>
       <div class="row">
         <button class="sec" onclick="saveConfig()">保存配置</button>
         <button class="ghost" onclick="testModel()">🔌 测试是否可用</button>
@@ -1216,6 +1330,7 @@ async function loadSavedConfig(){
     if(c.base_url) document.getElementById('baseUrl').value=c.base_url;
     if(c.api_key) document.getElementById('apiKey').value=c.api_key;
     if(c.pexels_api_key) document.getElementById('pexelsKey').value=c.pexels_api_key;
+    if(c.pixabay_api_key) document.getElementById('pixabayKey').value=c.pixabay_api_key;
     if(c.model_name){
       const m=document.getElementById('modelName');
       if(![...m.options].some(o=>o.value===c.model_name)){
@@ -1279,7 +1394,8 @@ async function saveConfig(){
     api_key:document.getElementById('apiKey').value.trim(),
     base_url:document.getElementById('baseUrl').value.trim(),
     model_name:custom||document.getElementById('modelName').value.trim(),
-    pexels_api_key:document.getElementById('pexelsKey').value.trim()
+    pexels_api_key:document.getElementById('pexelsKey').value.trim(),
+    pixabay_api_key:document.getElementById('pixabayKey').value.trim()
   };
   try{
     const r=await fetch(API+"/api/v1/mpt_config",{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -1483,6 +1599,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg["base_url"] = (body.get("base_url") or "").strip()
             cfg["model_name"] = (body.get("model_name") or "").strip()
             cfg["pexels_api_key"] = (body.get("pexels_api_key") or "").strip()
+            cfg["pixabay_api_key"] = (body.get("pixabay_api_key") or "").strip()
             save_config(cfg)
             self._send_json({"status": 200, "message": "saved"})
 
