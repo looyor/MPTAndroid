@@ -331,35 +331,69 @@ def gtts_lang(voice):
     return "zh-CN"
 
 
-def tts_to_file(text, voice, out_path, timeout=60):
+def _ssml_escape(t):
+    return (t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;").replace("'", "&apos;"))
+
+
+def _build_ssml(voice, style, text, lang):
+    return (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="%s">'
+        '<voice name="%s"><mstts:express-as style="%s">%s</mstts:express-as>'
+        '</voice></speak>' % (lang, voice, style, _ssml_escape(text))
+    )
+
+
+def tts_to_file(text, voice_spec, out_path, timeout=60):
     """用 edge-tts（微软在线 TTS，国内直连）生成配音。
 
+    voice_spec 支持两种形式：
+      - "zh-CN-XiaoxiaoNeural"            → 基础语音
+      - "zh-CN-XiaoxiaoNeural||cheerful"  → 语音 + 微软朗读风格(SSML style)
+    风格若不被服务端支持会自动回退为基础语音，保证一定有声音。
     返回音频时长（秒）估计值；超时/失败返回 None（后续用静音兜底）。
-    关键：用 asyncio.wait_for 加超时，避免像旧 gTTS 那样访问 Google
-    无限阻塞，从而导致「进度一直 0%」且永不报错。
     """
+    voice_spec = (voice_spec or "zh-CN-XiaoxiaoNeural").strip()
+    if "||" in voice_spec:
+        voice, style = voice_spec.split("||", 1)
+        voice, style = voice.strip(), style.strip()
+    else:
+        voice, style = voice_spec, ""
     lang = gtts_lang(voice)
-    try:
-        import asyncio
-        import edge_tts
 
-        async def _gen():
-            # voice 形如 zh-CN-XiaoxiaoNeural（不含 -Female 后缀）
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(out_path)
+    import asyncio
+    import edge_tts
 
-        asyncio.run(asyncio.wait_for(_gen(), timeout=timeout))
-        if not (os.path.isfile(out_path) and os.path.getsize(out_path) > 0):
-            raise RuntimeError("edge-tts 未产出有效音频")
-        return estimate_duration(text, lang)
-    except Exception as e:
-        print("tts(edge) error: %s" % e, flush=True)
+    async def _run(use_style):
+        if use_style and style:
+            comm = edge_tts.Communicate(_build_ssml(voice, style, text, lang), voice)
+        else:
+            comm = edge_tts.Communicate(text, voice)
+        await comm.save(out_path)
+
+    # 先试带风格，失败再退回基础语音（避免某个 style 不被支持导致整句没声音）
+    for use_style in ([True, False] if style else [False]):
         try:
-            if os.path.isfile(out_path):
-                os.remove(out_path)
-        except Exception:
-            pass
-        return None
+            try:
+                if os.path.isfile(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+            asyncio.run(asyncio.wait_for(_run(use_style), timeout=timeout))
+            if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                return estimate_duration(text, lang)
+            raise RuntimeError("edge-tts 未产出有效音频")
+        except Exception as e:
+            print("tts(edge) error(style=%s, voice=%s): %s" % (use_style, voice, e), flush=True)
+            continue
+
+    try:
+        if os.path.isfile(out_path):
+            os.remove(out_path)
+    except Exception:
+        pass
+    return None
 
 
 def estimate_duration(text, lang):
@@ -374,19 +408,65 @@ def estimate_duration(text, lang):
 # --------------------------------------------------------------------------- #
 # 画面渲染（PIL）—— 渐变背景 + 居中字幕
 # --------------------------------------------------------------------------- #
-def load_font(size):
-    candidates = [
-        os.path.join(ASSET_ROOT, "fonts", "MicrosoftYaHeiBold.ttc"),
-        os.path.join(ASSET_ROOT, "fonts", "MicrosoftYaHeiNormal.ttc"),
-        os.path.join(ASSET_ROOT, "fonts", "STHeitiMedium.ttc"),
-        os.path.join(ASSET_ROOT, "fonts", "STHeitiLight.ttc"),
+# 系统中文 TTF 探测（Android 绝大多数机型自带，零体积、渲染质量好）
+_SYS_CN_FONT = None
+
+
+def _detect_system_cn_font():
+    import glob
+    # 常见中文系统字体路径（按命中优先级排序）
+    explicit = [
+        "/system/fonts/NotoSansCJK-Regular.ttc",
+        "/system/fonts/NotoSansCJKsc-Regular.otf",
+        "/system/fonts/NotoSansSC-Regular.otf",
+        "/system/fonts/NotoSansSC-Medium.otf",
+        "/system/fonts/NotoSansCJK-Bold.ttc",
+        "/system/fonts/DroidSansFallback.ttf",
+        "/system/fonts/DroidSansFallbackFull.ttf",
     ]
-    for c in candidates:
+    for c in explicit:
         if os.path.isfile(c):
+            try:
+                ImageFont.truetype(c, 10)
+                return c
+            except Exception:
+                continue
+    # 兜底扫描：找文件名含中文相关关键字的字体
+    for pat in ["/system/fonts/*.ttc", "/system/fonts/*.otf", "/system/fonts/*.ttf"]:
+        for c in sorted(glob.glob(pat)):
+            low = c.lower()
+            if any(k in low for k in ["cjk", "notosanssc", "notosanscjk", "fallback", "han", "sc-", "hei"]):
+                try:
+                    ImageFont.truetype(c, 10)
+                    return c
+                except Exception:
+                    continue
+    return None
+
+
+def load_font(size):
+    """加载中文字体：优先系统中文 TTF → 内置 Noto Sans SC → 默认位图字体。
+
+    旧版引用了 4 个损坏的 .ttc（PIL 无法解析），静默回退到 10px 默认位图字体，
+    导致 1080x1920 画面上字幕几乎不可见（看起来像「没图像」）。这里改成先探测
+    系统中文 TTF，再用内置有效字体，确保中文清晰可见。
+    """
+    global _SYS_CN_FONT
+    if _SYS_CN_FONT is None:
+        _SYS_CN_FONT = _detect_system_cn_font() or ""
+
+    candidates = []
+    if _SYS_CN_FONT:
+        candidates.append(_SYS_CN_FONT)
+    if ASSET_ROOT:
+        candidates.append(os.path.join(ASSET_ROOT, "fonts", "NotoSansSC-Regular.otf"))
+    for c in candidates:
+        if c and os.path.isfile(c):
             try:
                 return ImageFont.truetype(c, size)
             except Exception:
                 continue
+    # 极端兜底：仍用默认字体（中文会变成方块，但至少有画面）
     return ImageFont.load_default()
 
 
@@ -422,14 +502,16 @@ def get_bg(w, h):
 
 
 def render_frame(text, w, h, idx, total, seed=0):
-    """在缓存渐变背景上叠加字幕，返回 PNG 字节（不再逐像素绘制）。"""
-    img = get_bg(w, h)
-    draw = ImageDraw.Draw(img)
-
-    # 半透明暗条增强字幕可读性
-    bar_h = int(h * 0.42)
+    """在缓存渐变背景上叠加半透明字幕条与居中字幕，返回 PNG 字节。"""
+    base = get_bg(w, h).convert("RGB")
+    # 真正的半透明字幕条：在 RGBA 覆盖层绘制后再 alpha 合成。
+    # 旧写法 fill=(0,0,0,0) 在 RGB 图上 alpha 失效，会变成纯黑实心矩形（画面像断成两半）。
+    bar_h = int(h * 0.44)
     bar_y = int((h - bar_h) / 2)
-    draw.rectangle([0, bar_y, w, bar_y + bar_h], fill=(0, 0, 0, 0))
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ImageDraw.Draw(overlay).rectangle([0, bar_y, w, bar_y + bar_h], fill=(0, 0, 0, 120))
+    img = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+    draw = ImageDraw.Draw(img)
 
     font = load_font(int(h * 0.055))
     max_w = int(w * 0.86)
@@ -787,13 +869,40 @@ UI_HTML = r"""<!DOCTYPE html>
       <div>
         <label>配音语言</label>
         <select id="voice">
-          <option value="zh-CN-XiaoxiaoNeural">中文·晓晓(女)</option>
-          <option value="zh-CN-YunxiNeural">中文·云希(男)</option>
-          <option value="zh-CN-YunyangNeural">中文·云扬(男·新闻)</option>
-          <option value="en-US-AriaNeural">English·Aria</option>
-          <option value="en-US-GuyNeural">English·Guy</option>
-          <option value="ja-JP-NanamiNeural">日本語·七海</option>
-          <option value="ja-JP-KeitaNeural">日本語・啓太</option>
+          <optgroup label="女声（17）">
+            <option value="zh-CN-XiaoxiaoNeural||chat" selected>晓晓·聊天(女)</option>
+            <option value="zh-CN-XiaoxiaoNeural||cheerful">晓晓·活泼(女)</option>
+            <option value="zh-CN-XiaoxiaoNeural||calm">晓晓·沉稳(女)</option>
+            <option value="zh-CN-XiaoxiaoNeural||serious">晓晓·严肃(女)</option>
+            <option value="zh-CN-XiaoxiaoNeural||affectionate">晓晓·亲切(女)</option>
+            <option value="zh-CN-XiaoxiaoNeural||gentle">晓晓·温柔(女)</option>
+            <option value="zh-CN-XiaoxiaoNeural||sad">晓晓·忧伤(女)</option>
+            <option value="zh-CN-XiaoxiaoNeural||angry">晓晓·激动(女)</option>
+            <option value="zh-CN-XiaoxiaoNeural||newscast">晓晓·新闻(女)</option>
+            <option value="zh-CN-XiaoxiaoNeural||sports">晓晓·体育(女)</option>
+            <option value="zh-CN-XiaoyiNeural">一伊(女)</option>
+            <option value="zh-TW-HsiaoChenNeural">晓臻(台湾·女)</option>
+            <option value="zh-TW-HsiaoYuNeural">晓雨(台湾·女)</option>
+            <option value="zh-HK-HiuGaaiNeural">晓佳(粤语·女)</option>
+            <option value="zh-HK-HiuMaanNeural">晓曼(粤语·女)</option>
+            <option value="zh-CN-liaoning-XiaobeiNeural">晓北(东北话·女)</option>
+            <option value="zh-CN-shaanxi-XiaoniNeural">晓妮(陕西话·女)</option>
+          </optgroup>
+          <optgroup label="男声（13）">
+            <option value="zh-CN-YunxiNeural||chat">云希·聊天(男)</option>
+            <option value="zh-CN-YunxiNeural||cheerful">云希·活泼(男)</option>
+            <option value="zh-CN-YunxiNeural||calm">云希·沉稳(男)</option>
+            <option value="zh-CN-YunxiNeural||serious">云希·严肃(男)</option>
+            <option value="zh-CN-YunxiNeural||gentle">云希·温柔(男)</option>
+            <option value="zh-CN-YunxiNeural||sad">云希·忧伤(男)</option>
+            <option value="zh-CN-YunxiNeural||angry">云希·激动(男)</option>
+            <option value="zh-CN-YunxiNeural||sports">云希·体育(男)</option>
+            <option value="zh-CN-YunyangNeural">云扬(新闻·男)</option>
+            <option value="zh-CN-YunjianNeural">云健(男)</option>
+            <option value="zh-CN-YunxiaNeural">云夏(男)</option>
+            <option value="zh-TW-YunJheNeural">云哲(台湾·男)</option>
+            <option value="zh-HK-WanLungNeural">云龙(粤语·男)</option>
+          </optgroup>
         </select>
       </div>
       <div>
