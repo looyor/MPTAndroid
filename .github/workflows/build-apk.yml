@@ -15,6 +15,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 完整拉取（不要用 fetch-depth:1）。通过 Git Data API 推送后触发构建时，
+          # 浅克隆可能拉到尚未传播到副本的旧 main 顶端，导致打出的 APK 是旧代码。
+          # 完整克隆可确保构建使用推送后的最新源码。
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
