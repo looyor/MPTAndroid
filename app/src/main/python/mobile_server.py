@@ -26,7 +26,8 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
+import base64
 
 import requests
 import shutil
@@ -216,6 +217,7 @@ def load_config():
         "model_name": "",
         "pexels_api_key": "",
         "pixabay_api_key": "",
+        "ai_image": "on",
     }
     try:
         if CONFIG_PATH and os.path.isfile(CONFIG_PATH):
@@ -367,17 +369,29 @@ def llm_base_model(provider, cfg):
 
 
 def chat_complete(provider, cfg, messages, temperature=0.8, timeout=120):
-    base, model = llm_base_model(provider, cfg)
     api_key = (cfg.get("api_key") or "").strip()
+    if not api_key:
+        # 无 Key：走 Pollinations 免费文本接口（aifreeforever 等免费站的底层引擎），
+        # 把对话拼成单段 prompt 直接取回文本，实现「无 Key 也能生成文案/分镜」。
+        prompt = "\n\n".join((m.get("content") or "") for m in messages)
+        return pollinations_text(prompt, timeout)
+    base, model = llm_base_model(provider, cfg)
     url = base + "/chat/completions"
     payload = {"model": model, "messages": messages, "temperature": temperature}
     headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = "Bearer " + api_key
+    headers["Authorization"] = "Bearer " + api_key
     r = requests.post(url, json=payload, headers=headers, timeout=timeout)
     r.raise_for_status()
     data = r.json()
     return data["choices"][0]["message"]["content"].strip()
+
+
+def pollinations_text(prompt, timeout=120, model="openai"):
+    """Pollinations 无 Key 文本接口：用于未配置大模型 Key 时的文案/分镜兜底。"""
+    url = "https://text.pollinations.ai/%s?model=%s" % (quote(prompt), quote(model))
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.text.strip()
 
 
 def generate_script(subject, cfg, word_count=None):
@@ -472,6 +486,30 @@ def generate_plan(subject, cfg, word_count=None):
         plain = generate_script(subject, cfg, word_count)
         segments = [{"text": s, "keyword": ""} for s in split_sentences(plain)]
         return {"script": plain, "segments": segments}
+
+
+# --------------------------------------------------------------------------- #
+# 语音转文字（口播 → 文案）：用用户已配置的 OpenAI 兼容 Key 调 Whisper
+# --------------------------------------------------------------------------- #
+def transcribe_audio(audio_path, cfg, timeout=180):
+    """用配置的 OpenAI 兼容 Key 调 Whisper 转写（口播→文字）。无 Key 抛错提示。"""
+    api_key = (cfg.get("api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError("口播转写需要配置大模型 Key（Whisper）。请先到「配置」填写 API Key。")
+    provider = (cfg.get("provider") or "openai").lower()
+    base, _ = llm_base_model(provider, cfg)
+    url = base.rstrip("/") + "/audio/transcriptions"
+    model = (cfg.get("transcribe_model") or "").strip() or {
+        "groq": "whisper-large-v3", "openai": "whisper-1",
+        "moonshot": "whisper-1", "zhipu": "whisper-1",
+    }.get(provider, "whisper-1")
+    with open(audio_path, "rb") as f:
+        files = {"file": (os.path.basename(audio_path), f, "audio/mpeg")}
+        data = {"model": model, "response_format": "json"}
+        r = requests.post(url, headers={"Authorization": "Bearer " + api_key},
+                         files=files, data=data, timeout=timeout)
+    r.raise_for_status()
+    return (r.json().get("text") or "").strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -875,6 +913,33 @@ def fetch_stock_clip(keyword, subject, aspect, task_dir, idx, cfg, timeout=45):
     return None
 
 
+def fetch_ai_image(keyword, subject, aspect, task_dir, idx, timeout=90):
+    """Pollinations 无 Key 图片接口：为每句文案生成一张真实场景图。
+
+    这是「无 Pixabay/Pexels Key」时的最佳兜底——用 AI 免费生成电影感实拍风
+    画面，替代离线文字卡，让出片从「文字 PPT」变成「AI 场景视频」。失败返回 None。
+    """
+    dims = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
+    w, h = dims.get(aspect, (1080, 1920))
+    base = (keyword or subject or "scenery").strip() or "scenery"
+    prompt = ("%s, cinematic shot, highly detailed, photorealistic, 4k, "
+              "professional photography, natural lighting, no text, no watermark, "
+              "vertical composition" % base)
+    seed = (idx * 7919 + 17) % 1000000
+    url = ("https://image.pollinations.ai/prompt/%s?width=%d&height=%d&nologo=true"
+           "&model=flux&seed=%d&enhance=true" % (quote(prompt), w, h, seed))
+    out = os.path.join(task_dir, "aiimg_%03d.jpg" % idx)
+    try:
+        _download(url, out, timeout=timeout)
+        if os.path.isfile(out) and os.path.getsize(out) > 3000:
+            return out
+        if os.path.isfile(out):
+            os.remove(out)
+    except Exception as e:
+        print("ai image(%s) 失败：%s" % (base, e), flush=True)
+    return None
+
+
 def encode_common(quality="hd", encoder=None):
     """统一的视频编码参数，按探测到的可用编码器自适应。
 
@@ -954,8 +1019,12 @@ def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd", tas
         inputs += ["-i", audio_path]
     else:
         inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
-    vf = ("scale='iw*1.12':'ih*1.12',"
-          "crop=%d:%d:x='(iw-%d)/2+18*sin(t*0.35)':y='(ih-%d)/2+14*cos(t*0.28)'" % (w, h, w, h))
+    # cover 自适应铺满（处理源图小于/不等于目标尺寸，如 AI 场景图可能是 576x1024 或方图），
+    # 再轻微放大 1.12 倍做 Ken Burns 平移缩放；保证任意尺寸/比例源都能裁到目标分辨率，
+    # 否则片段分辨率不一致会让最终 concat(-c copy) 失败或出花屏。
+    vf = ("scale=%d:%d:force_original_aspect_ratio=increase," % (w, h)
+          + "scale='iw*1.12':'ih*1.12',"
+          + "crop=%d:%d:x='(iw-%d)/2+18*sin(t*0.35)':y='(ih-%d)/2+14*cos(t*0.28)'" % (w, h, w, h))
 
     def build(q, use_vf=True):
         tail = (["-vf", vf] if use_vf else []) + encode_common(q)
@@ -1052,13 +1121,20 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
                 f.write(render_subtitle_png(text, w, h))
             prep[i] = {"mode": "online", "bg": bg, "sub": sub_path, "audio": audio_path, "adur": adur}
         else:
-            card_path = os.path.join(task_dir, "frame_%03d.png" % i)
-            with open(card_path, "wb") as f:
-                f.write(render_frame(text, w, h, i, n_orig, seed=0))
-            prep[i] = {"mode": "offline", "card": card_path, "audio": audio_path, "adur": adur}
+            # 无 stock 素材：优先用 AI 场景图（无 Key），失败再退回文字卡
+            ai_path = None
+            if (cfg.get("ai_image") or "on") != "off":
+                ai_path = fetch_ai_image(seg.get("keyword") or "", subject, aspect, task_dir, i, timeout=90)
+            if ai_path:
+                prep[i] = {"mode": "offline", "card": ai_path, "audio": audio_path, "adur": adur}
+            else:
+                card_path = os.path.join(task_dir, "frame_%03d.png" % i)
+                with open(card_path, "wb") as f:
+                    f.write(render_frame(text, w, h, i, n_orig, seed=0))
+                prep[i] = {"mode": "offline", "card": card_path, "audio": audio_path, "adur": adur}
 
     if not has_stock:
-        log(task_id, "未配置 Pexels/Pixabay Key，使用离线动态背景（纯本地、无需联网）；配置后可拉真实高清画面")
+        log(task_id, "未配置 Pexels/Pixabay Key：将用 AI 场景图(无Key) 作背景；配置后可拉真实高清视频")
     log(task_id, "并行准备 %d 个片段（配音 + 素材）..." % n_orig)
     done_a = 0
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -1305,7 +1381,9 @@ UI_HTML = r"""<!DOCTYPE html>
       <input id="pixabayKey" type="text" placeholder="去 pixabay.com/api/docs/ 免费申请；留空则用离线动态背景">
       <label>Pexels Key（备选素材源，可留空）</label>
       <input id="pexelsKey" type="text" placeholder="去 pexels.com/api 免费申请；被暂停可改用上面的 Pixabay">
-      <div class="hint">填了 <b>Pixabay 或 Pexels</b> 任一 Key：每句文案会去拉<b>真实高清视频</b>做背景（最像抖音短剧）。两者都填时优先 Pexels、失败自动切 Pixabay。都不填也能用——用本地字幕卡的动态背景（Ken Burns），纯离线、无需联网。</div>
+      <div class="hint">填了 <b>Pixabay 或 Pexels</b> 任一 Key：每句文案会去拉<b>真实高清视频</b>做背景（最像抖音短剧）。两者都填时优先 Pexels、失败自动切 Pixabay。都不填也能用——自动用 <b>AI 免费生成真实场景图</b>作背景（无 Key、免申请）。</div>
+      <label class="chk"><input type="checkbox" id="aiImage" checked> AI 场景图背景（无 Key · 免申请）</label>
+      <div class="hint">不填 Pixabay/Pexels 时，每句文案用 AI 免费生成一张电影感实拍风画面作背景，无需任何 Key。关掉则退回纯文字卡。需要联网。</div>
       <div class="row">
         <button class="sec" onclick="saveConfig()">保存配置</button>
         <button class="ghost" onclick="testModel()">🔌 测试是否可用</button>
@@ -1330,6 +1408,11 @@ UI_HTML = r"""<!DOCTYPE html>
     <div class="row">
       <input id="wordCount" type="number" min="50" max="2000" step="50" placeholder="字数(留空随机，如300)" style="flex:1;min-width:0">
       <button class="ghost" onclick="genScript()">AI 生成文案</button>
+    </div>
+    <div class="hint" style="margin:8px 0 2px">🎙 已有录音？上传音频自动转文字并生成视频（需配置大模型 Key / Whisper）：</div>
+    <div class="row">
+      <input id="voiceFile" type="file" accept="audio/*" style="flex:1;min-width:0">
+      <button class="ghost" onclick="transcribeAudio()">🎙 转写并填入</button>
     </div>
     <label>文案（可手动修改）</label>
     <textarea id="script" placeholder="在此填写或自动生成视频文案..."></textarea>
@@ -1466,6 +1549,7 @@ async function loadSavedConfig(){
     if(c.api_key) document.getElementById('apiKey').value=c.api_key;
     if(c.pexels_api_key) document.getElementById('pexelsKey').value=c.pexels_api_key;
     if(c.pixabay_api_key) document.getElementById('pixabayKey').value=c.pixabay_api_key;
+    if(c.ai_image) document.getElementById('aiImage').checked=(c.ai_image!=='off');
     if(c.model_name){
       const m=document.getElementById('modelName');
       if(![...m.options].some(o=>o.value===c.model_name)){
@@ -1530,7 +1614,8 @@ async function saveConfig(){
     base_url:document.getElementById('baseUrl').value.trim(),
     model_name:custom||document.getElementById('modelName').value.trim(),
     pexels_api_key:document.getElementById('pexelsKey').value.trim(),
-    pixabay_api_key:document.getElementById('pixabayKey').value.trim()
+    pixabay_api_key:document.getElementById('pixabayKey').value.trim(),
+    ai_image:(document.getElementById('aiImage').checked?'on':'off')
   };
   try{
     const r=await fetch(API+"/api/v1/mpt_config",{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -1594,6 +1679,25 @@ async function genScript(){
     }else{
       log('生成失败：'+(j.message||JSON.stringify(j)));
       alert('文案生成失败：'+(j.message||''));
+    }
+  }catch(e){log('错误：'+e.message);alert('请求失败：'+e.message);}
+}
+
+async function transcribeAudio(){
+  const f=document.getElementById('voiceFile').files[0];
+  if(!f){alert('请先选择一段音频文件');return;}
+  log('正在上传并转写音频（约 10~30 秒）...');
+  try{
+    const b64=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res((r.result||'').split(',')[1]);r.onerror=rej;r.readAsDataURL(f);});
+    const resp=await fetch(API+"/api/v1/transcribe",{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio:b64,name:f.name})});
+    const j=await resp.json();
+    if(j&&j.data&&j.data.text){
+      document.getElementById('script').value=j.data.text;
+      log('转写完成 ✅，已填入文案（共 '+j.data.text.length+' 字）。点「生成视频」即可。');
+      alert('转写完成，已填入文案！');
+    }else{
+      log('转写失败：'+(j.message||JSON.stringify(j)));
+      alert('转写失败：'+(j.message||''));
     }
   }catch(e){log('错误：'+e.message);alert('请求失败：'+e.message);}
 }
@@ -1769,6 +1873,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg["model_name"] = (body.get("model_name") or "").strip()
             cfg["pexels_api_key"] = (body.get("pexels_api_key") or "").strip()
             cfg["pixabay_api_key"] = (body.get("pixabay_api_key") or "").strip()
+            cfg["ai_image"] = (body.get("ai_image") or "on")
             save_config(cfg)
             self._send_json({"status": 200, "message": "saved"})
 
@@ -1779,9 +1884,7 @@ class Handler(BaseHTTPRequestHandler):
             if not subject:
                 self._send_json({"status": 400, "message": "缺少主题"}, 400)
                 return
-            if not cfg.get("api_key") and provider_needs_key(cfg.get("provider")):
-                self._send_json({"status": 400, "message": "请先在「配置」中填写 API Key"}, 400)
-                return
+            # 无 Key 时由 chat_complete 自动走 Pollinations 免费文本接口，不再拦截
             try:
                 script = generate_script(subject, cfg, word_count)
                 self._send_json({"status": 200, "data": {"video_script": script}})
@@ -1795,9 +1898,7 @@ class Handler(BaseHTTPRequestHandler):
             if not subject:
                 self._send_json({"status": 400, "message": "缺少主题"}, 400)
                 return
-            if not cfg.get("api_key") and provider_needs_key(cfg.get("provider")):
-                self._send_json({"status": 400, "message": "请先在「配置」中填写 API Key"}, 400)
-                return
+            # 无 Key 时由 chat_complete 自动走 Pollinations 免费文本接口，不再拦截
             try:
                 plan = generate_plan(subject, cfg, word_count)
                 self._send_json({"status": 200, "data": plan})
@@ -1821,21 +1922,20 @@ class Handler(BaseHTTPRequestHandler):
                     segs = [{"text": s, "keyword": ""} for s in split_sentences(script)]
                 plan = {"script": script or " ".join(x["text"] for x in segs), "segments": segs}
             elif not script:
-                if subject and (cfg.get("api_key") or not provider_needs_key(cfg.get("provider"))):
+                if subject:
+                    # 无 Key 时由 chat_complete 自动走 Pollinations 免费文本接口
                     try:
                         plan = generate_plan(subject, cfg, word_count)
                     except Exception as e:
                         self._send_json({"status": 500, "message": "文案生成失败：%s" % e})
                         return
                 else:
-                    self._send_json({"status": 400, "message": "请先填写文案或主题(并配置Key)"}, 400)
+                    self._send_json({"status": 400, "message": "请先填写文案或主题"}, 400)
                     return
             else:
-                # 用户手填文案：按句拆分，无关键词 → 走离线背景兜底
+                # 用户手填文案：按句拆分，无关键词 → 走 AI 场景图/离线背景兜底
                 plan = {"script": script, "segments": [{"text": s, "keyword": ""} for s in split_sentences(script)]}
-            if not cfg.get("api_key") and provider_needs_key(cfg.get("provider")):
-                self._send_json({"status": 400, "message": "请先配置 API Key"}, 400)
-                return
+            # 无 Key 也能生成（Pollinations 免费文本 + edge-tts + AI 场景图），不再强制拦截
             voice = (body.get("voice_name") or "zh-CN-XiaoxiaoNeural")
             aspect = (body.get("video_aspect") or "9:16")
             # 画质：'hd' 高清优先（默认，接近抖音短剧）/ 'fast' 极速
@@ -1851,6 +1951,34 @@ class Handler(BaseHTTPRequestHandler):
             duration_sec = int(max(0, min(10, duration_min)) * 60)
             task_id = create_task(plan, voice, aspect, cfg, duration_sec, quality)
             self._send_json({"status": 200, "data": {"task_id": task_id}})
+
+        elif path == "/api/v1/transcribe":
+            # 口播转视频：前端把音频读成 base64 传上来，后端用 Whisper 转写后返回文字
+            cfg = load_config()
+            b64 = (body.get("audio") or "").strip()
+            name = (body.get("name") or "audio.mp3")
+            if not b64:
+                self._send_json({"status": 400, "message": "缺少音频数据"}, 400)
+                return
+            tmp = None
+            try:
+                ext = os.path.splitext(name)[1].lower() or ".mp3"
+                tmp = os.path.join(tempfile.gettempdir(), "mpt_voice_%s%s" % (uuid.uuid4().hex[:8], ext))
+                with open(tmp, "wb") as f:
+                    f.write(base64.b64decode(b64))
+                text = transcribe_audio(tmp, cfg)
+                if not text:
+                    self._send_json({"status": 500, "message": "转写结果为空"}, 500)
+                    return
+                self._send_json({"status": 200, "data": {"text": text}})
+            except Exception as e:
+                self._send_json({"status": 500, "message": "转写失败：%s" % e})
+            finally:
+                if tmp and os.path.isfile(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
 
         elif path == "/api/v1/test":
             cfg = {
