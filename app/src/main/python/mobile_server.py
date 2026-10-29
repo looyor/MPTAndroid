@@ -18,6 +18,14 @@ import json
 import math
 import os
 import re
+
+# shuohao 短剧工艺：把 eternityspring/shuohao-skills 的提示词方法论落地到设备端生成链路。
+# 仅依赖标准库；不运行原项目的 Node 引擎，而是复用其「让 LLM 产出更专业剧本/分镜」的工艺。
+try:
+    import shuohao
+except Exception as _sh_err:
+    shuohao = None
+    print("shuohao 模块加载失败，分镜增强降级为关闭：%s" % _sh_err, flush=True)
 import subprocess
 import tempfile
 import threading
@@ -218,6 +226,7 @@ def load_config():
         "pexels_api_key": "",
         "pixabay_api_key": "",
         "ai_image": "on",
+        "shuohao": "on",   # 专业分镜增强（eternityspring/shuohao-skills 短剧工艺）
     }
     try:
         if CONFIG_PATH and os.path.isfile(CONFIG_PATH):
@@ -459,6 +468,20 @@ def generate_plan(subject, cfg, word_count=None):
         sys_prompt += (
             " script 正文严格控制在 %d 字左右（按中文字符数计），内容要充实连贯。" % wc
         )
+    # shuohao 专业分镜增强：注入 AI 短剧创作工艺（剧本/美术/分镜），并扩展 JSON 字段
+    use_sh = bool(shuohao) and shuohao.shuohao_enabled(cfg)
+    if use_sh:
+        sys_prompt = shuohao.enrich_plan_prompt(sys_prompt)
+        sys_prompt += (
+            "\n\n额外字段要求（在 segments 每项与顶层补充，缺失则留空字符串）：\n"
+            'segments[].visual_prompt: 英文电影感场景图提示词（空景禁人、不写角色名、不写渲染风格词）；\n'
+            "segments[].shot: wide(大景)/medium(中景)/close(近景) 三选一；\n"
+            "segments[].mood: 本句氛围(tense/warm/calm/gloomy/hopeful/urgent…)；\n"
+            "segments[].delivery: 本句语气(平静/紧张/激昂/温柔/忧伤/严肃/愤怒…)；\n"
+            "segments[].action: 本句画面里的常见动作短语(中文)；\n"
+            "segments[].speaker: 旁白 或 角色名；\n"
+            '顶层 hook: 一句话冷开场钩子；顶层 style_anchor: 整段共用的视觉一致性锚点(英文短语)。'
+        )
     try:
         text = chat_complete(provider, cfg, [
             {"role": "system", "content": sys_prompt},
@@ -473,14 +496,26 @@ def generate_plan(subject, cfg, word_count=None):
             if not t:
                 continue
             kw = (s.get("keyword") or "").strip()
-            segments.append({"text": t, "keyword": kw})
+            seg = {"text": t, "keyword": kw}
+            if use_sh:
+                seg["visual_prompt"] = (s.get("visual_prompt") or "").strip()
+                seg["shot"] = (s.get("shot") or "").strip().lower()
+                seg["mood"] = (s.get("mood") or "").strip()
+                seg["delivery"] = (s.get("delivery") or "").strip()
+                seg["action"] = (s.get("action") or "").strip()
+                seg["speaker"] = (s.get("speaker") or "").strip()
+            segments.append(seg)
         if not script and segments:
             script = " ".join(x["text"] for x in segments)
         if not segments and script:
             segments = [{"text": s, "keyword": ""} for s in split_sentences(script)]
         if not script or not segments:
             raise ValueError("解析为空")
-        return {"script": script, "segments": segments}
+        plan = {"script": script, "segments": segments}
+        if use_sh:
+            plan["hook"] = (obj.get("hook") or "").strip()
+            plan["style_anchor"] = (obj.get("style_anchor") or "").strip()
+        return plan
     except Exception as e:
         print("generate_plan 解析失败，回退纯文本分句：%s" % e, flush=True)
         plain = generate_script(subject, cfg, word_count)
@@ -913,18 +948,28 @@ def fetch_stock_clip(keyword, subject, aspect, task_dir, idx, cfg, timeout=45):
     return None
 
 
-def fetch_ai_image(keyword, subject, aspect, task_dir, idx, timeout=90):
+def fetch_ai_image(keyword, subject, aspect, task_dir, idx, timeout=90,
+                   visual_prompt=None, mood=None, style_anchor=None, shuohao_on=False):
     """Pollinations 无 Key 图片接口：为每句文案生成一张真实场景图。
 
     这是「无 Pixabay/Pexels Key」时的最佳兜底——用 AI 免费生成电影感实拍风
     画面，替代离线文字卡，让出片从「文字 PPT」变成「AI 场景视频」。失败返回 None。
+
+    shuohao_on 且传入 visual_prompt 时，改用 shuohao 工艺生成「电影感 + 空景禁人 +
+    表面处理 + 光照 + 一致性锚点」的提示词，画面专业度显著提升（这也是抖音短剧感的关键）。
     """
     dims = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
     w, h = dims.get(aspect, (1080, 1920))
-    base = (keyword or subject or "scenery").strip() or "scenery"
-    prompt = ("%s, cinematic shot, highly detailed, photorealistic, 4k, "
-              "professional photography, natural lighting, no text, no watermark, "
-              "vertical composition" % base)
+    # 决定提示词：优先 shuohao 工艺；否则沿用旧版通用电影感提示词
+    if shuohao_on and shuohao and visual_prompt:
+        prompt = shuohao.visual_prompt_for(
+            {"visual_prompt": visual_prompt, "keyword": keyword, "mood": mood},
+            style_anchor or "")
+    else:
+        base = (keyword or subject or "scenery").strip() or "scenery"
+        prompt = ("%s, cinematic shot, highly detailed, photorealistic, 4k, "
+                  "professional photography, natural lighting, no text, no watermark, "
+                  "vertical composition" % base)
     seed = (idx * 7919 + 17) % 1000000
     url = ("https://image.pollinations.ai/prompt/%s?width=%d&height=%d&nologo=true"
            "&model=flux&seed=%d&enhance=true" % (quote(prompt), w, h, seed))
@@ -936,7 +981,7 @@ def fetch_ai_image(keyword, subject, aspect, task_dir, idx, timeout=90):
         if os.path.isfile(out):
             os.remove(out)
     except Exception as e:
-        print("ai image(%s) 失败：%s" % (base, e), flush=True)
+        print("ai image(%s) 失败：%s" % (visual_prompt or keyword or subject, e), flush=True)
     return None
 
 
@@ -1010,8 +1055,12 @@ def compose_online(bg_video, sub_png, audio_path, w, h, out_path, quality="hd", 
     raise last or RuntimeError("在线合成失败")
 
 
-def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd", task_id=None):
-    """离线兜底：对字幕卡做缓慢平移缩放(Ken Burns)生成动态背景 + 配音。"""
+def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd", task_id=None, motion=None):
+    """离线兜底：对字幕卡做缓慢平移缩放(Ken Burns)生成动态背景 + 配音。
+
+    motion: shuohao 工艺给的运镜参数 (zoom, dx, dy, phase)，按景别(景别)变化，
+    让相邻片段运动深浅相间、更有镜头语言；为 None 时用默认中景参数。
+    """
     has_audio = bool(audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0)
     # 显式 -f image2 -loop 1 -framerate 30：比裸 -loop 1 更明确，避免 demuxer 推断差异
     inputs = ["-y", "-f", "image2", "-loop", "1", "-framerate", "30", "-i", card_png]
@@ -1020,11 +1069,13 @@ def compose_offline(card_png, audio_path, w, h, dur, out_path, quality="hd", tas
     else:
         inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
     # cover 自适应铺满（处理源图小于/不等于目标尺寸，如 AI 场景图可能是 576x1024 或方图），
-    # 再轻微放大 1.12 倍做 Ken Burns 平移缩放；保证任意尺寸/比例源都能裁到目标分辨率，
+    # 再轻微放大做 Ken Burns 平移缩放；保证任意尺寸/比例源都能裁到目标分辨率，
     # 否则片段分辨率不一致会让最终 concat(-c copy) 失败或出花屏。
+    zoom, dx, dy, phase = (motion or (1.12, 18, 14, 0))
     vf = ("scale=%d:%d:force_original_aspect_ratio=increase," % (w, h)
-          + "scale='iw*1.12':'ih*1.12',"
-          + "crop=%d:%d:x='(iw-%d)/2+18*sin(t*0.35)':y='(ih-%d)/2+14*cos(t*0.28)'" % (w, h, w, h))
+          + "scale='iw*%s':'ih*%s'," % (zoom, zoom)
+          + "crop=%d:%d:x='(iw-%d)/2+%d*sin(t*0.35+%s)':y='(ih-%d)/2+%d*cos(t*0.28+%s)'"
+            % (w, h, w, dx, phase, h, dy, phase))
 
     def build(q, use_vf=True):
         tail = (["-vf", vf] if use_vf else []) + encode_common(q)
@@ -1090,6 +1141,9 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
     w, h = res.get(aspect, (1080, 1920))
     lang = gtts_lang(voice)
     n_orig = len(segments)
+    # shuohao 专业分镜增强：决定文案/画面/TTS/运镜是否启用工艺
+    use_sh = bool(shuohao) and shuohao.shuohao_enabled(cfg)
+    style_anchor = (plan.get("style_anchor") or "").strip()
 
     # 时长控制：文案自然时长不足时循环整段凑到目标；不拉伸音频，保证口播自然。
     natural = sum(estimate_duration(s["text"], lang) for s in segments)
@@ -1108,8 +1162,16 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
     def prep_segment(i):
         seg = segments[i]
         text = seg["text"]
+        # shuohao：把 delivery(语气) 映射成 edge-tts 朗读风格，让配音更有表现力
+        voice_eff = voice
+        motion = None
+        if use_sh:
+            style = shuohao.style_for_delivery(seg.get("delivery"), lang)
+            if style:
+                voice_eff = voice + "||" + style
+            motion = shuohao.shot_motion(seg.get("shot"), i)
         audio_path = os.path.join(task_dir, "audio_%03d.mp3" % i)
-        adur = tts_to_file(text, voice, audio_path)
+        adur = tts_to_file(text, voice_eff, audio_path)
         if adur is None:
             log(task_id, "⚠ 第%d句配音失败（edge-tts 不可用？），静音兜底" % (i + 1))
         bg = None
@@ -1124,14 +1186,19 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
             # 无 stock 素材：优先用 AI 场景图（无 Key），失败再退回文字卡
             ai_path = None
             if (cfg.get("ai_image") or "on") != "off":
-                ai_path = fetch_ai_image(seg.get("keyword") or "", subject, aspect, task_dir, i, timeout=90)
+                ai_path = fetch_ai_image(
+                    seg.get("keyword") or "", subject, aspect, task_dir, i, timeout=90,
+                    visual_prompt=seg.get("visual_prompt"), mood=seg.get("mood"),
+                    style_anchor=style_anchor, shuohao_on=use_sh)
             if ai_path:
-                prep[i] = {"mode": "offline", "card": ai_path, "audio": audio_path, "adur": adur}
+                prep[i] = {"mode": "offline", "card": ai_path, "audio": audio_path,
+                           "adur": adur, "motion": motion}
             else:
                 card_path = os.path.join(task_dir, "frame_%03d.png" % i)
                 with open(card_path, "wb") as f:
                     f.write(render_frame(text, w, h, i, n_orig, seed=0))
-                prep[i] = {"mode": "offline", "card": card_path, "audio": audio_path, "adur": adur}
+                prep[i] = {"mode": "offline", "card": card_path, "audio": audio_path,
+                           "adur": adur, "motion": motion}
 
     if not has_stock:
         log(task_id, "未配置 Pexels/Pixabay Key：将用 AI 场景图(无Key) 作背景；配置后可拉真实高清视频")
@@ -1155,7 +1222,8 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
             if p["mode"] == "online":
                 compose_online(p["bg"], p["sub"], p["audio"], w, h, clip_path, quality, task_id)
             else:
-                compose_offline(p["card"], p["audio"], w, h, dur, clip_path, quality, task_id)
+                compose_offline(p["card"], p["audio"], w, h, dur, clip_path, quality, task_id,
+                                motion=p.get("motion"))
         except Exception as e:
             # 真实素材解码失败等 → 退回离线动态背景，保证出片
             log(task_id, "片段%d 合成失败，退回离线背景：%s" % (i + 1, e))
@@ -1163,7 +1231,8 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
             if not (os.path.isfile(card_path) and os.path.getsize(card_path) > 0):
                 with open(card_path, "wb") as f:
                     f.write(render_frame(segments[i]["text"], w, h, i, n_orig, seed=0))
-            compose_offline(card_path, p["audio"], w, h, dur, clip_path, quality, task_id)
+            compose_offline(card_path, p["audio"], w, h, dur, clip_path, quality, task_id,
+                            motion=p.get("motion"))
         return clip_path
 
     log(task_id, "并发编码 %d 个片段..." % n_orig)
@@ -1384,6 +1453,8 @@ UI_HTML = r"""<!DOCTYPE html>
       <div class="hint">填了 <b>Pixabay 或 Pexels</b> 任一 Key：每句文案会去拉<b>真实高清视频</b>做背景（最像抖音短剧）。两者都填时优先 Pexels、失败自动切 Pixabay。都不填也能用——自动用 <b>AI 免费生成真实场景图</b>作背景（无 Key、免申请）。</div>
       <label class="chk"><input type="checkbox" id="aiImage" checked> AI 场景图背景（无 Key · 免申请）</label>
       <div class="hint">不填 Pixabay/Pexels 时，每句文案用 AI 免费生成一张电影感实拍风画面作背景，无需任何 Key。关掉则退回纯文字卡。需要联网。</div>
+      <label class="chk"><input type="checkbox" id="shuohao" checked> 🎬 专业分镜增强（shuohao 短剧工艺）</label>
+      <div class="hint">内置开源 <b>shuohao-skills</b> 短剧工艺：让 AI 写出带冷开场钩子 / 语气分镜的文案，并生成<b>电影感、空景禁人</b>的场景图、按景别(大景/中景/近景)做运镜。关掉则退回普通口播模式。Licensed Apache-2.0（eternityspring）。</div>
       <div class="row">
         <button class="sec" onclick="saveConfig()">保存配置</button>
         <button class="ghost" onclick="testModel()">🔌 测试是否可用</button>
@@ -1550,6 +1621,7 @@ async function loadSavedConfig(){
     if(c.pexels_api_key) document.getElementById('pexelsKey').value=c.pexels_api_key;
     if(c.pixabay_api_key) document.getElementById('pixabayKey').value=c.pixabay_api_key;
     if(c.ai_image) document.getElementById('aiImage').checked=(c.ai_image!=='off');
+    if(c.shuohao!==undefined) document.getElementById('shuohao').checked=(c.shuohao!=='off');
     if(c.model_name){
       const m=document.getElementById('modelName');
       if(![...m.options].some(o=>o.value===c.model_name)){
@@ -1615,7 +1687,8 @@ async function saveConfig(){
     model_name:custom||document.getElementById('modelName').value.trim(),
     pexels_api_key:document.getElementById('pexelsKey').value.trim(),
     pixabay_api_key:document.getElementById('pixabayKey').value.trim(),
-    ai_image:(document.getElementById('aiImage').checked?'on':'off')
+    ai_image:(document.getElementById('aiImage').checked?'on':'off'),
+    shuohao:(document.getElementById('shuohao').checked?'on':'off')
   };
   try{
     const r=await fetch(API+"/api/v1/mpt_config",{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -1720,7 +1793,11 @@ async function genVideo(){
     const r=await fetch(API+"/api/v1/videos",{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         video_subject:subject||" ", video_script:script,
-        segments:segments, video_aspect:document.getElementById('aspect').value,
+        segments:segments,
+        hook:(window.curPlan&&window.curPlan.hook)||"",
+        style_anchor:(window.curPlan&&window.curPlan.style_anchor)||"",
+        shuohao:(document.getElementById('shuohao').checked?'on':'off'),
+        video_aspect:document.getElementById('aspect').value,
         voice_name:document.getElementById('voice').value,
         duration_min:document.getElementById('durationMin').value,
         quality:document.getElementById('quality').value
@@ -1874,6 +1951,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg["pexels_api_key"] = (body.get("pexels_api_key") or "").strip()
             cfg["pixabay_api_key"] = (body.get("pixabay_api_key") or "").strip()
             cfg["ai_image"] = (body.get("ai_image") or "on")
+            cfg["shuohao"] = (body.get("shuohao") or "on")
             save_config(cfg)
             self._send_json({"status": 200, "message": "saved"})
 
@@ -1912,15 +1990,30 @@ class Handler(BaseHTTPRequestHandler):
             word_count = body.get("word_count")
             seg_in = body.get("segments") or []
             if seg_in and isinstance(seg_in, list) and len(seg_in) > 0:
-                # 前端传回结构化简案（含关键词）：优先使用，保证 Pexels 真实素材生效
+                # 前端传回结构化简案（含关键词/工艺字段）：优先使用，保证 Pexels 真实素材生效
                 segs = []
                 for s in seg_in:
                     t = (s.get("text") or "").strip()
-                    if t:
-                        segs.append({"text": t, "keyword": (s.get("keyword") or "").strip()})
+                    if not t:
+                        continue
+                    segs.append({
+                        "text": t,
+                        "keyword": (s.get("keyword") or "").strip(),
+                        "visual_prompt": (s.get("visual_prompt") or "").strip(),
+                        "shot": (s.get("shot") or "").strip().lower(),
+                        "mood": (s.get("mood") or "").strip(),
+                        "delivery": (s.get("delivery") or "").strip(),
+                        "action": (s.get("action") or "").strip(),
+                        "speaker": (s.get("speaker") or "").strip(),
+                    })
                 if not segs:
                     segs = [{"text": s, "keyword": ""} for s in split_sentences(script)]
                 plan = {"script": script or " ".join(x["text"] for x in segs), "segments": segs}
+                # 透传 shuohao 工艺顶层字段（若有）
+                if (body.get("hook") or "").strip():
+                    plan["hook"] = (body.get("hook") or "").strip()
+                if (body.get("style_anchor") or "").strip():
+                    plan["style_anchor"] = (body.get("style_anchor") or "").strip()
             elif not script:
                 if subject:
                     # 无 Key 时由 chat_complete 自动走 Pollinations 免费文本接口

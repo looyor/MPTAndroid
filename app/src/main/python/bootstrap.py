@@ -40,6 +40,13 @@ def start_server(mpt_home, ffmpeg_path, download_dir=None):
     mobile_server.ASSET_ROOT = os.path.join(here, "app", "_assets", "resource")
     mobile_server.DOWNLOAD_DIR = download_dir
 
+    # 把资源目录注入 shuohao 工艺模块（用于加载内置的短剧工艺提示词）
+    try:
+        import shuohao
+        shuohao.init(mobile_server.ASSET_ROOT)
+    except Exception as _sh_e:
+        print("shuohao 初始化失败，分镜增强降级：%s" % _sh_e, flush=True)
+
     if mobile_server.Image is None:
         print("WARNING: PIL 未就绪，字幕渲染将不可用：%s" % mobile_server._PIL_ERROR, flush=True)
 
