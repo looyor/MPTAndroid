@@ -21,6 +21,17 @@ jobs:
           # 完整克隆可确保构建使用推送后的最新源码。
           fetch-depth: 0
 
+      # 构建前关卡：确认 shuohao 源码与资源确实被检出。
+      # 若 checkout 竞态导致拉到旧树，这里会直接失败，避免发出不含 shuohao 的坏包。
+      - name: Verify shuohao sources present
+        run: |
+          set -euo pipefail
+          ls -l app/src/main/python/shuohao.py
+          ls -l app/src/main/python/app/_assets/resource/shuohao/PROMPT.md
+          grep -q "import shuohao" app/src/main/python/mobile_server.py || {
+            echo "ERROR: mobile_server.py 缺少 shuohao 集成"; exit 1; }
+          echo "shuohao 源码与资源均已检出 ✓"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -44,11 +55,38 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Build debug APK (Gradle 8.9)
+      # clean + --rerun-tasks + --no-build-cache：彻底禁用任何构建缓存，
+      # 强制 Chaquopy 从当前源码全量重新生成 app.imy（含 shuohao.pyc 与资源）。
+      - name: Build debug APK (clean + 禁用构建缓存)
         uses: gradle/gradle-build-action@v3
         with:
           gradle-version: 8.9
-          arguments: assembleDebug --no-daemon
+          arguments: clean assembleDebug --no-daemon --rerun-tasks --no-build-cache
+
+      # 构建后终检：解包 APK，确认 app.imy 内含 shuohao.pyc 且 mobile_server.pyc 含 shuohao 字节。
+      # 任一缺失则 CI 直接失败，绝不把坏包上传为 artifact。
+      - name: Verify APK contains shuohao
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, io, zipfile, sys
+          apks = glob.glob("app/build/outputs/apk/debug/*.apk")
+          if not apks:
+              print("ERROR: 未找到 APK"); sys.exit(1)
+          apk = apks[0]
+          print("APK =", apk)
+          z = zipfile.ZipFile(apk)
+          imy = [n for n in z.namelist() if n.endswith("chaquopy/app.imy")]
+          assert imy, "APK 内找不到 app.imy"
+          inner = zipfile.ZipFile(io.BytesIO(z.read(imy[0])))
+          names = inner.namelist()
+          assert "shuohao.pyc" in names, "ERROR: shuohao.pyc 未打入 app.imy"
+          assert any("shuohao" in n for n in names), "ERROR: shuohao 资源未打入 app.imy"
+          ms = inner.read("mobile_server.pyc")
+          assert b"shuohao" in ms, "ERROR: mobile_server.pyc 不含 shuohao 字节"
+          assert b"visual_prompt_for" in ms, "ERROR: mobile_server.pyc 不含 visual_prompt_for"
+          print("APK 校验通过：shuohao.pyc 与资源均已打入，mobile_server 已集成 ✓")
+          PY
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
