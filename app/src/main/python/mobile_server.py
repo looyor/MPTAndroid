@@ -227,6 +227,9 @@ def load_config():
         "pixabay_api_key": "",
         "ai_image": "on",
         "shuohao": "on",   # 专业分镜增强（eternityspring/shuohao-skills 短剧工艺）
+        "modelscope_token": "",  # 魔搭 Z-Image-Turbo 免费出图 Token（国内直连、能出人物）
+        "image_engine": "modelscope",  # modelscope / pollinations / auto
+        "tts_voice": "zh-CN-XiaoxiaoNeural||chat",
     }
     try:
         if CONFIG_PATH and os.path.isfile(CONFIG_PATH):
@@ -423,14 +426,75 @@ def generate_script(subject, cfg, word_count=None):
             "自然成段，不要为了凑字数而重复或堆砌。" % wc
         )
     user_prompt = "主题：%s" % subject
-    text = chat_complete(provider, cfg, [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_prompt},
-    ])
-    # 去掉可能的代码块包裹
-    text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-    text = re.sub(r"\n?```$", "", text).strip()
-    return text
+    try:
+        text = chat_complete(provider, cfg, [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ])
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+        text = sanitize_narration(text)
+        if not text or len(text) < 6:
+            raise ValueError("文案为空或过短")
+        return text
+    except Exception as e:
+        print("generate_script 联网生成失败，使用本地模板兜底：%s" % e, flush=True)
+        return local_template_script(subject, word_count)
+
+
+def sanitize_narration(text):
+    """清洗配音文本：去掉代码块 / markdown / 行内代码 / URL / JSON / 乱码符号，
+    确保喂给 TTS 的一定是干净口语，绝不会把「代码」念出来。"""
+    if not text:
+        return ""
+    t = text
+    # 1) 去代码围栏与行内代码
+    t = re.sub(r"```[\s\S]*?```", " ", t)
+    t = re.sub(r"`[^`]*`", " ", t)
+    # 2) 去 URL
+    t = re.sub(r"https?://\S+", " ", t)
+    # 3) 去 JSON / 大括号块
+    t = re.sub(r"\{[^{}]*\}", " ", t)
+    t = re.sub(r"\[[^\]]*\]", " ", t)
+    # 4) 逐行过滤：丢掉像代码/标记的行，去掉行内代码符号
+    kept = []
+    for line in t.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # 含 3 个以上代码符号的行直接丢弃（多半是代码/配置）
+        if re.search(r"[{}<>;=\[\]\(\)]{3,}", s):
+            continue
+        if s.startswith(("#", "//", "/*", "* ", "- ", "1.", "1、")):
+            continue
+        s2 = re.sub(r"[#*`<>\[\]{}|=]+", "", s)
+        if len(s2) >= 2:
+            kept.append(s2)
+    t = " ".join(kept)
+    # 5) 收尾
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def local_template_script(subject, word_count=None):
+    """完全离线也能出片的兜底文案：生成一段干净、口语化、可配音的中文短句。
+    仅在联网文案生成失败（如无网络 / 模型 503）时启用，保证 App 永远有得播。"""
+    s = (subject or "这个主题").strip() or "这个主题"
+    return (
+        "今天我们来聊聊%s。" % s +
+        "%s这个话题，其实很多朋友都关心。" % s +
+        "说到底，关键在于我们怎么去理解它、怎么去行动。" +
+        "如果你也感兴趣，不妨先从身边一个小小的改变开始。" +
+        "后面我会持续分享更多实用内容，记得点赞收藏，我们下期见。"
+    )
+
+
+def _simple_visual_for(text, subject):
+    """无 Key / 简单路径下，用中文直接生成电影感场景图提示词（魔搭/ Pollinations 均接受中文）。
+    明确允许画面中有主体人物或场景，避免「空景禁人」。"""
+    t = (text or subject or "风景").strip()
+    return ("%s，电影感画面，真实摄影风格，自然光线，画面中有自然出镜的主体人物或真实场景，"
+            "4k，高清，氛围生动" % t)
 
 
 def _clean_llm_json(text):
@@ -470,11 +534,15 @@ def generate_plan(subject, cfg, word_count=None):
         )
     # shuohao 专业分镜增强：注入 AI 短剧创作工艺（剧本/美术/分镜），并扩展 JSON 字段
     use_sh = bool(shuohao) and shuohao.shuohao_enabled(cfg)
-    if use_sh:
+    api_key = (cfg.get("api_key") or "").strip()
+    # 只有当「开了 shuohao 且有可靠模型 Key」时才用重结构化简案：
+    # 免费/零 Key 模型扛不住超长工艺提示词（会 503 返回代码/乱码），此时走简单路径。
+    structured = use_sh and bool(api_key)
+    if structured:
         sys_prompt = shuohao.enrich_plan_prompt(sys_prompt)
         sys_prompt += (
             "\n\n额外字段要求（在 segments 每项与顶层补充，缺失则留空字符串）：\n"
-            'segments[].visual_prompt: 英文电影感场景图提示词（空景禁人、不写角色名、不写渲染风格词）；\n'
+            'segments[].visual_prompt: 英文电影感场景图提示词（画面中可有主体人物/真实场景，不要写渲染风格词）；\n'
             "segments[].shot: wide(大景)/medium(中景)/close(近景) 三选一；\n"
             "segments[].mood: 本句氛围(tense/warm/calm/gloomy/hopeful/urgent…)；\n"
             "segments[].delivery: 本句语气(平静/紧张/激昂/温柔/忧伤/严肃/愤怒…)；\n"
@@ -483,44 +551,66 @@ def generate_plan(subject, cfg, word_count=None):
             '顶层 hook: 一句话冷开场钩子；顶层 style_anchor: 整段共用的视觉一致性锚点(英文短语)。'
         )
     try:
-        text = chat_complete(provider, cfg, [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": "主题：%s" % subject},
-        ])
-        obj = json.loads(_clean_llm_json(text))
-        script = (obj.get("script") or "").strip()
-        segs = obj.get("segments") or []
-        segments = []
-        for s in segs:
-            t = (s.get("text") or "").strip()
-            if not t:
-                continue
-            kw = (s.get("keyword") or "").strip()
-            seg = {"text": t, "keyword": kw}
-            if use_sh:
+        if structured:
+            text = chat_complete(provider, cfg, [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": "主题：%s" % subject},
+            ])
+            obj = json.loads(_clean_llm_json(text))
+            script = sanitize_narration(obj.get("script") or "")
+            segs = obj.get("segments") or []
+            segments = []
+            for s in segs:
+                t = sanitize_narration(s.get("text") or "")
+                if not t:
+                    continue
+                kw = (s.get("keyword") or "").strip()
+                seg = {"text": t, "keyword": kw}
                 seg["visual_prompt"] = (s.get("visual_prompt") or "").strip()
                 seg["shot"] = (s.get("shot") or "").strip().lower()
                 seg["mood"] = (s.get("mood") or "").strip()
                 seg["delivery"] = (s.get("delivery") or "").strip()
                 seg["action"] = (s.get("action") or "").strip()
                 seg["speaker"] = (s.get("speaker") or "").strip()
-            segments.append(seg)
-        if not script and segments:
-            script = " ".join(x["text"] for x in segments)
-        if not segments and script:
-            segments = [{"text": s, "keyword": ""} for s in split_sentences(script)]
-        if not script or not segments:
-            raise ValueError("解析为空")
-        plan = {"script": script, "segments": segments}
-        if use_sh:
+                segments.append(seg)
+            if not script and segments:
+                script = " ".join(x["text"] for x in segments)
+            if not segments and script:
+                segments = [{"text": s, "keyword": "",
+                             "visual_prompt": _simple_visual_for(s, subject),
+                             "shot": "medium", "mood": "calm", "delivery": "平静",
+                             "action": "", "speaker": "旁白"} for s in split_sentences(script)]
+            if not script or not segments:
+                raise ValueError("解析为空")
+            plan = {"script": script, "segments": segments}
             plan["hook"] = (obj.get("hook") or "").strip()
             plan["style_anchor"] = (obj.get("style_anchor") or "").strip()
-        return plan
+            return plan
+        else:
+            # 简单路径：纯文案（已 sanitize + 离线兜底）+ 本地推导结构字段。
+            # 用「轻提示词」避免免费模型 503，并显式允许人物/场景出现。
+            plain = generate_script(subject, cfg, word_count)
+            segments = []
+            for s in split_sentences(plain):
+                segments.append({
+                    "text": s,
+                    "keyword": (subject or s)[:30],
+                    "visual_prompt": _simple_visual_for(s, subject),
+                    "shot": "medium", "mood": "calm", "delivery": "平静",
+                    "action": "", "speaker": "旁白",
+                })
+            if not segments:
+                raise ValueError("分句为空")
+            return {"script": plain, "segments": segments,
+                    "hook": "", "style_anchor": subject}
     except Exception as e:
-        print("generate_plan 解析失败，回退纯文本分句：%s" % e, flush=True)
-        plain = generate_script(subject, cfg, word_count)
-        segments = [{"text": s, "keyword": ""} for s in split_sentences(plain)]
-        return {"script": plain, "segments": segments}
+        print("generate_plan 失败，回退本地模板分句：%s" % e, flush=True)
+        plain = local_template_script(subject, word_count)
+        segments = [{"text": s, "keyword": (subject or s)[:30],
+                     "visual_prompt": _simple_visual_for(s, subject),
+                     "shot": "medium", "mood": "calm", "delivery": "平静",
+                     "action": "", "speaker": "旁白"} for s in split_sentences(plain)]
+        return {"script": plain, "segments": segments, "hook": "", "style_anchor": subject}
 
 
 # --------------------------------------------------------------------------- #
@@ -736,7 +826,7 @@ def get_bg(w, h):
         return _BG_CACHE[key].copy()
     # Image.linear_gradient("L") 是 C 实现的 256x256 垂直灰度渐变，colorize 上色极快
     base = Image.linear_gradient("L").resize((w, h))
-    bg = ImageOps.colorize(base, black=(18, 24, 38), white=(46, 52, 68))
+    bg = ImageOps.colorize(base, black=(40, 48, 74), white=(120, 138, 176))
     _BG_CACHE[key] = bg
     return bg.copy()
 
@@ -948,32 +1038,102 @@ def fetch_stock_clip(keyword, subject, aspect, task_dir, idx, cfg, timeout=45):
     return None
 
 
-def fetch_ai_image(keyword, subject, aspect, task_dir, idx, timeout=90,
-                   visual_prompt=None, mood=None, style_anchor=None, shuohao_on=False):
-    """Pollinations 无 Key 图片接口：为每句文案生成一张真实场景图。
+def fetch_modelscope_image(prompt, w, h, token, out, timeout=120):
+    """魔搭 ModelScope Z-Image-Turbo 文生图（国内直连、免费 2000 次/天、中文友好、能出人物）。
 
-    这是「无 Pixabay/Pexels Key」时的最佳兜底——用 AI 免费生成电影感实拍风
-    画面，替代离线文字卡，让出片从「文字 PPT」变成「AI 场景视频」。失败返回 None。
-
-    shuohao_on 且传入 visual_prompt 时，改用 shuohao 工艺生成「电影感 + 空景禁人 +
-    表面处理 + 光照 + 一致性锚点」的提示词，画面专业度显著提升（这也是抖音短剧感的关键）。
+    异步任务创建 + 轮询。成功返回 out 路径，失败/超时返回 None。
     """
-    dims = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
-    w, h = dims.get(aspect, (1080, 1920))
-    # 决定提示词：优先 shuohao 工艺；否则沿用旧版通用电影感提示词
-    if shuohao_on and shuohao and visual_prompt:
-        prompt = shuohao.visual_prompt_for(
-            {"visual_prompt": visual_prompt, "keyword": keyword, "mood": mood},
-            style_anchor or "")
+    if not token:
+        return None
+    # 尺寸按竖/横/方给常用档（模型对超大图较慢，限制长边），合成时再裁到目标分辨率
+    if w < h:
+        size = "864x1152"   # 竖屏 9:16
+    elif w > h:
+        size = "1152x864"   # 横屏 16:9
     else:
-        base = (keyword or subject or "scenery").strip() or "scenery"
-        prompt = ("%s, cinematic shot, highly detailed, photorealistic, 4k, "
-                  "professional photography, natural lighting, no text, no watermark, "
-                  "vertical composition" % base)
+        size = "1024x1024"  # 方形
+    api = "https://api-inference.modelscope.cn/v1/images/generations"
+    body = {"model": "Tongyi-MAI/Z-Image-Turbo", "prompt": prompt, "size": size}
+    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+               "X-ModelScope-Async-Mode": "true"}
+    try:
+        r = requests.post(api, json=body, headers=headers, timeout=30)
+        if r.status_code != 200:
+            print("魔搭出图创建失败：%d %s" % (r.status_code, r.text[:200]), flush=True)
+            return None
+        j = r.json()
+        task_id_m = (j.get("task_id") or (j.get("output") or {}).get("task_id")
+                     or j.get("request_id") or j.get("id"))
+        # 同步直出（部分部署会直接返回图片）
+        imgs0 = (j.get("output_images") or (j.get("output") or {}).get("output_images")
+                 or j.get("images") or [])
+        if not task_id_m and imgs0:
+            return _save_first_image(imgs0, out, timeout)
+        if not task_id_m:
+            print("魔搭出图未返回 task_id：%s" % str(j)[:200], flush=True)
+            return None
+        # 轮询
+        poll_url = "https://api-inference.modelscope.cn/v1/tasks/%s" % task_id_m
+        ph = {"Authorization": "Bearer " + token, "X-ModelScope-Task-Type": "image_generation"}
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                pr = requests.get(poll_url, headers=ph, timeout=20)
+                if pr.status_code != 200:
+                    break
+                pj = pr.json()
+            except Exception as e:
+                print("魔搭轮询异常：%s" % e, flush=True)
+                time.sleep(3)
+                continue
+            st = (pj.get("task_status") or pj.get("status") or "").upper()
+            if st in ("SUCCEED", "SUCCESS", "SUCCEEDED"):
+                imgs = (pj.get("output_images") or (pj.get("output") or {}).get("output_images")
+                        or (pj.get("output") or {}).get("images")
+                        or pj.get("images") or [])
+                if imgs:
+                    if _save_first_image(imgs, out, timeout):
+                        return out
+                break
+            if st in ("FAILED", "FAIL", "CANCELED", "CANCELLED"):
+                print("魔搭出图任务失败：%s" % str(pj)[:200], flush=True)
+                break
+            time.sleep(3)
+    except Exception as e:
+        print("魔搭出图异常：%s" % e, flush=True)
+    return None
+
+
+def _save_first_image(images, out, timeout):
+    """从图片 URL 列表下载第一张到 out；支持 list[str] 或 [{'url':...}]。返回是否成功。"""
+    url = None
+    for im in images:
+        if isinstance(im, str) and im.startswith("http"):
+            url = im
+            break
+        if isinstance(im, dict):
+            u = im.get("url") or im.get("image_url") or im.get("b64") or ""
+            if u and u.startswith("http"):
+                url = u
+                break
+    if not url:
+        return False
+    try:
+        _download(url, out, timeout=timeout)
+        if os.path.isfile(out) and os.path.getsize(out) > 3000:
+            return True
+        if os.path.isfile(out):
+            os.remove(out)
+    except Exception as e:
+        print("魔搭图片下载失败：%s" % e, flush=True)
+    return False
+
+
+def _fetch_pollinations_image(prompt, w, h, out, idx, timeout=90):
+    """Pollinations 无 Key 图片接口（海外，作为魔搭的备选出图源）。"""
     seed = (idx * 7919 + 17) % 1000000
     url = ("https://image.pollinations.ai/prompt/%s?width=%d&height=%d&nologo=true"
            "&model=flux&seed=%d&enhance=true" % (quote(prompt), w, h, seed))
-    out = os.path.join(task_dir, "aiimg_%03d.jpg" % idx)
     try:
         _download(url, out, timeout=timeout)
         if os.path.isfile(out) and os.path.getsize(out) > 3000:
@@ -981,7 +1141,46 @@ def fetch_ai_image(keyword, subject, aspect, task_dir, idx, timeout=90,
         if os.path.isfile(out):
             os.remove(out)
     except Exception as e:
-        print("ai image(%s) 失败：%s" % (visual_prompt or keyword or subject, e), flush=True)
+        print("pollinations 出图(%s) 失败：%s" % (prompt[:40], e), flush=True)
+    return None
+
+
+def fetch_ai_image(keyword, subject, aspect, task_dir, idx, timeout=90,
+                   visual_prompt=None, mood=None, style_anchor=None, shuohao_on=False,
+                   engine="auto", modelscope_token=""):
+    """为每句文案生成一张真实场景图（可含人物）。
+
+    出图引擎优先级：魔搭 Z-Image-Turbo（国内直连、免费、能出人物）→ Pollinations（海外、无 Key）。
+    engine: modelscope / pollinations / auto（auto=按有无 Token 自动选，无 Token 则退 Pollinations）。
+    全部失败返回 None（调用方退回本地彩色场景卡兜底，不再黑屏）。
+    """
+    dims = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
+    w, h = dims.get(aspect, (1080, 1920))
+    # 决定提示词：优先 shuohao 工艺（已允许人物）；否则通用电影感提示词（也允许人物）
+    if shuohao_on and shuohao and visual_prompt:
+        prompt = shuohao.visual_prompt_for(
+            {"visual_prompt": visual_prompt, "keyword": keyword, "mood": mood},
+            style_anchor or "")
+    else:
+        base = (keyword or subject or "scenery").strip() or "scenery"
+        prompt = ("%s, cinematic shot, a subject or person in the scene, highly detailed, "
+                  "photorealistic, 4k, professional photography, natural lighting, "
+                  "no text, no watermark, vertical composition" % base)
+    out = os.path.join(task_dir, "aiimg_%03d.jpg" % idx)
+    # 选引擎：auto 有 Token 走魔搭，否则 Pollinations；显式 modelscope 无 Token 也退回 Pollinations
+    try_ms = (engine in ("modelscope", "auto")) and bool(modelscope_token)
+    try_poll = (engine in ("pollinations", "auto")) or (engine == "modelscope" and not modelscope_token)
+    if try_ms:
+        if fetch_modelscope_image(prompt, w, h, modelscope_token, out, timeout):
+            return out
+    if try_poll:
+        if _fetch_pollinations_image(prompt, w, h, out, idx, timeout):
+            return out
+    if os.path.isfile(out):
+        try:
+            os.remove(out)
+        except Exception:
+            pass
     return None
 
 
@@ -1161,7 +1360,10 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
 
     def prep_segment(i):
         seg = segments[i]
-        text = seg["text"]
+        # 关键：配音前先把文案清洗成干净口语，杜绝「念代码/念 JSON」的情况
+        text = sanitize_narration(seg.get("text") or "")
+        if not text:
+            text = (seg.get("text") or "。").strip() or "。"
         # shuohao：把 delivery(语气) 映射成 edge-tts 朗读风格，让配音更有表现力
         voice_eff = voice
         motion = None
@@ -1183,13 +1385,15 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
                 f.write(render_subtitle_png(text, w, h))
             prep[i] = {"mode": "online", "bg": bg, "sub": sub_path, "audio": audio_path, "adur": adur}
         else:
-            # 无 stock 素材：优先用 AI 场景图（无 Key），失败再退回文字卡
+            # 无 stock 素材：优先用 AI 场景图（魔搭/ Pollinations），失败再退回本地彩色场景卡
             ai_path = None
             if (cfg.get("ai_image") or "on") != "off":
                 ai_path = fetch_ai_image(
                     seg.get("keyword") or "", subject, aspect, task_dir, i, timeout=90,
                     visual_prompt=seg.get("visual_prompt"), mood=seg.get("mood"),
-                    style_anchor=style_anchor, shuohao_on=use_sh)
+                    style_anchor=style_anchor, shuohao_on=use_sh,
+                    engine=(cfg.get("image_engine") or "auto"),
+                    modelscope_token=(cfg.get("modelscope_token") or "").strip())
             if ai_path:
                 prep[i] = {"mode": "offline", "card": ai_path, "audio": audio_path,
                            "adur": adur, "motion": motion}
@@ -1306,6 +1510,18 @@ def build_video(task_id, plan, voice, aspect, cfg, duration_sec=0, quality="hd")
         TASKS[task_id]["videos"] = ["/tasks/%s/%s" % (task_id, os.path.basename(final_path))]
         if saved:
             TASKS[task_id]["download_path"] = saved
+    # 落盘元数据，供「作品」页展示主题/文案/时间（不依赖内存 TASKS 状态）
+    try:
+        with open(os.path.join(task_dir, "meta.json"), "w", encoding="utf-8") as mf:
+            json.dump({
+                "task_id": task_id,
+                "subject": (subject or plan.get("script", ""))[:160],
+                "script": subject or plan.get("script", ""),
+                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "size": os.path.getsize(final_path),
+            }, mf, ensure_ascii=False)
+    except Exception:
+        pass
     log(task_id, "视频生成完成 ✅ %s" % final_path)
 
 
@@ -1331,6 +1547,44 @@ def export_to_downloads(task_id, video_path, script):
     except Exception as e:
         log(task_id, "导出到 Download/Ai视频 失败（请检查存储权限）：%s" % e)
         return None
+
+
+def list_history():
+    """扫描本地已生成成片，返回作品列表（按生成时间倒序）。
+
+    读取每个任务目录下的 meta.json；没有 meta.json 时也回退扫描 final.mp4。
+    供「作品」页展示与回看。失败时返回空列表（不崩页面）。
+    """
+    items = []
+    try:
+        base = os.path.join(MPT_HOME, "tasks") if MPT_HOME else None
+        if not base or not os.path.isdir(base):
+            return items
+        for tid in sorted(os.listdir(base), reverse=True):
+            tdir = os.path.join(base, tid)
+            if not os.path.isdir(tdir):
+                continue
+            # 优先 final.mp4，其次 final_music.mp4
+            video = None
+            for cand in ("final.mp4", "final_music.mp4"):
+                p = os.path.join(tdir, cand)
+                if os.path.isfile(p) and os.path.getsize(p) > 10000:
+                    video = cand
+                    break
+            if not video:
+                continue
+            meta = {"task_id": tid, "subject": tid, "script": "", "created": "", "size": 0}
+            try:
+                with open(os.path.join(tdir, "meta.json"), "r", encoding="utf-8") as mf:
+                    meta.update(json.load(mf))
+            except Exception:
+                pass
+            meta["url"] = "/tasks/%s/%s" % (tid, video)
+            meta["size"] = int(meta.get("size") or 0)
+            items.append(meta)
+    except Exception as e:
+        print("list_history 异常：%s" % e, flush=True)
+    return items
 
 
 def pick_background_music():
@@ -1392,50 +1646,170 @@ UI_HTML = r"""<!DOCTYPE html>
   body{margin:0;background:var(--bg);color:var(--text);
        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
        font-size:15px;line-height:1.5}
-  .wrap{max-width:720px;margin:0 auto;padding:14px 14px 60px}
-  h1{font-size:20px;margin:6px 0 2px}
-  .sub{color:var(--muted);font-size:12px;margin-bottom:14px}
+  .topbar{position:sticky;top:0;z-index:10;background:rgba(11,12,16,.96);backdrop-filter:blur(6px);
+          padding:11px 14px 9px;border-bottom:1px solid var(--border)}
+  .topbar .title{font-size:17px;font-weight:700}
+  .sub{color:var(--muted);font-size:12px;margin-top:2px}
+  .content{max-width:720px;margin:0 auto;padding:14px 14px 84px}
+  .tabpanel{display:none}
+  .tabpanel.active{display:block;animation:fade .25s ease}
+  @keyframes fade{from{opacity:.4;transform:translateY(6px)}to{opacity:1;transform:none}}
+  h2{font-size:15px;margin:0 0 10px;color:#fff}
   .card{background:var(--card);border:1px solid var(--border);border-radius:14px;
         padding:14px;margin-bottom:14px}
-  .card h2{font-size:15px;margin:0 0 10px;color:#fff}
   label{display:block;font-size:12px;color:var(--muted);margin:10px 0 5px}
   input,select,textarea{width:100%;background:var(--input);border:1px solid var(--border);
         color:var(--text);border-radius:10px;padding:10px;font-size:14px;outline:none}
   textarea{min-height:110px;resize:vertical}
   .row{display:flex;gap:10px}
-  .row>*{flex:1}
+  .row>*{flex:1;min-width:0}
   button{background:var(--accent);color:#fff;border:0;border-radius:10px;
           padding:11px 14px;font-size:14px;font-weight:600;cursor:pointer}
   button.sec{background:var(--accent2)}
   button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
   button.sm{padding:6px 12px;font-size:12px;font-weight:600}
   button:active{opacity:.85}
-  .hint{font-size:11px;color:var(--muted);margin-top:6px}
+  .hint{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.6}
   .log{background:#0d0f13;border:1px solid var(--border);border-radius:10px;
        padding:10px;font-size:12px;color:var(--muted);white-space:pre-wrap;
        max-height:200px;overflow:auto;margin-top:10px}
   .badge{font-size:11px;padding:2px 8px;border-radius:20px;background:#222;border:1px solid var(--border)}
-  .badge.run{color:var(--warn)} .badge.done{color:var(--ok)} .badge.err{color:var(--err)}
-  .badge.warn{color:var(--warn)}
+  .badge.run{color:var(--warn)} .badge.done{color:var(--ok)} .badge.err{color:var(--err)} .badge.warn{color:var(--warn)}
   video{width:100%;border-radius:10px;background:#000;margin-top:8px}
   a.dl{display:inline-block;margin-top:4px;color:var(--accent2);text-decoration:none;
        font-size:12px;font-weight:600;word-break:break-all}
-  .toggle{float:right;color:var(--muted);font-size:12px;cursor:pointer}
   .mkt-group{margin-top:10px;border-top:1px solid var(--border);padding-top:10px}
   .mkt-title{font-size:13px;color:#fff;font-weight:600;margin-bottom:6px}
   .mkt-item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed #222}
   .mname{flex:1;font-size:13px;color:var(--text);word-break:break-all}
+  .tabbar{position:fixed;left:0;right:0;bottom:0;z-index:20;display:flex;background:#0f1117;
+          border-top:1px solid var(--border)}
+  .tabbar button{flex:1;background:transparent;border:0;color:var(--muted);padding:7px 0 9px;
+          font-size:11px;display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer}
+  .tabbar button .ic{font-size:19px;line-height:1}
+  .tabbar button.active{color:var(--accent)}
+  .work{display:flex;gap:10px;align-items:center;background:var(--input);border:1px solid var(--border);
+        border-radius:12px;padding:10px;margin-bottom:10px}
+  .work video{width:96px;height:130px;object-fit:cover;border-radius:8px;margin:0;flex:none}
+  .work .info{flex:1;min-width:0}
+  .work .t{font-size:13px;color:var(--text);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .work .meta{font-size:11px;color:var(--muted);margin-top:4px}
+  .hl{color:var(--accent2)} .ok{color:var(--ok)} .warn{color:var(--warn)}
+  .help h3{font-size:14px;color:#fff;margin:14px 0 6px}
+  .help p{font-size:13px;color:var(--text);margin:6px 0}
+  .help .box{background:var(--input);border:1px solid var(--border);border-radius:10px;padding:10px;margin:8px 0}
+  .chk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text)!important;
+       cursor:pointer;margin:12px 0 2px}
+  .chk input{width:auto}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>MoneyPrinterTurbo <span class="badge">Android</span></h1>
-  <div class="sub">输入主题 → AI 生成文案 → 配音 + 字幕 → 输出短视频（单 APK，本地运行）</div>
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:8px">
+    <span class="title">🎬 MPT Turbo</span>
+    <span class="badge">v1.7.0</span>
+  </div>
+  <div class="sub">AI 一键生成短视频 · 本地运行</div>
+</div>
 
-  <div class="card" id="cfgCard">
-    <h2>① 配置大模型 <span class="toggle" onclick="toggleCfg()">展开/收起</span></h2>
-    <div class="body" style="display:none">
-      <label>大模型提供商</label>
+<div class="content">
+  <!-- 🎬 生成 -->
+  <section class="tabpanel active" id="tab-gen">
+    <div class="card">
+      <h2>① 写主题 / 文案</h2>
+      <label>视频主题 / 关键词</label>
+      <input id="subject" type="text" placeholder="例如：春天的花海，治愈系短视频">
+      <div class="row">
+        <input id="wordCount" type="number" min="50" max="2000" step="50" placeholder="字数(留空随机,如300)" style="flex:1;min-width:0">
+        <button class="ghost" onclick="genScript()">✨ AI 生成文案</button>
+      </div>
+      <div class="hint">🎙 已有录音？上传音频自动转文字并生成视频（需先配置大模型 Key）：</div>
+      <div class="row">
+        <input id="voiceFile" type="file" accept="audio/*" style="flex:1;min-width:0">
+        <button class="ghost" onclick="transcribeAudio()">🎙 转写填入</button>
+      </div>
+      <label>文案（可手动修改）</label>
+      <textarea id="script" placeholder="在此填写或自动生成视频文案..."></textarea>
+    </div>
+
+    <div class="card">
+      <h2>② 画面与配音</h2>
+      <div class="row">
+        <div>
+          <label>配音声音</label>
+          <select id="voice">
+            <optgroup label="女声">
+              <option value="zh-CN-XiaoxiaoNeural||chat" selected>晓晓·聊天(女)</option>
+              <option value="zh-CN-XiaoxiaoNeural||cheerful">晓晓·活泼(女)</option>
+              <option value="zh-CN-XiaoxiaoNeural||serious">晓晓·严肃(女)</option>
+              <option value="zh-CN-XiaoxiaoNeural||gentle">晓晓·温柔(女)</option>
+              <option value="zh-CN-XiaoxiaoNeural||sad">晓晓·忧伤(女)</option>
+              <option value="zh-CN-XiaoxiaoNeural||angry">晓晓·激动(女)</option>
+              <option value="zh-CN-YunxiNeural||chat">云希·聊天(男)</option>
+              <option value="zh-CN-YunxiNeural||serious">云希·严肃(男)</option>
+              <option value="zh-CN-YunxiNeural||gentle">云希·温柔(男)</option>
+            </optgroup>
+            <optgroup label="更多">
+              <option value="zh-CN-XiaoyiNeural">一伊(女)</option>
+              <option value="zh-CN-YunyangNeural">云扬(新闻·男)</option>
+              <option value="zh-TW-HsiaoChenNeural">晓臻(台湾·女)</option>
+              <option value="zh-HK-HiuGaaiNeural">晓佳(粤语·女)</option>
+            </optgroup>
+          </select>
+        </div>
+        <div>
+          <label>画面比例</label>
+          <select id="aspect">
+            <option value="9:16">竖屏 9:16</option>
+            <option value="16:9">横屏 16:9</option>
+            <option value="1:1">方形 1:1</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>视频时长（分钟）</label>
+          <select id="durationMin">
+            <option value="0">自动</option>
+            <option value="1">1</option><option value="2">2</option>
+            <option value="3">3</option><option value="5">5</option><option value="10">10</option>
+          </select>
+        </div>
+        <div>
+          <label>画质</label>
+          <select id="quality">
+            <option value="hd" selected>高清优先</option>
+            <option value="fast">极速生成</option>
+          </select>
+        </div>
+      </div>
+      <div class="hint">时长选「自动」按配音自然长度；选分钟会把视频循环/拉伸到指定长度。成片自动存到手机 <b>Download/Ai视频</b>。</div>
+      <button onclick="genVideo()" style="width:100%;margin-top:8px">▶ 生成视频</button>
+    </div>
+
+    <div class="card">
+      <h2>③ 进度 <span id="stateBadge" class="badge"></span></h2>
+      <div id="progressBox" style="display:none">
+        <div id="progressText" class="hint">进度：0%</div>
+      </div>
+      <div id="result"></div>
+      <div id="log" class="log"></div>
+    </div>
+  </section>
+
+  <!-- 🎞 作品 -->
+  <section class="tabpanel" id="tab-works">
+    <div class="card">
+      <h2>🎞 我的作品</h2>
+      <div id="worksList" class="hint">加载中...</div>
+    </div>
+  </section>
+
+  <!-- ⚙️ 配置 -->
+  <section class="tabpanel" id="tab-cfg">
+    <div class="card">
+      <h2>大模型（必填一项）</h2>
+      <label>提供商</label>
       <select id="provider" onchange="onProviderChange()"></select>
       <div class="hint" id="keyHint"></div>
       <label>API Key</label>
@@ -1446,141 +1820,84 @@ UI_HTML = r"""<!DOCTYPE html>
       <select id="modelName"></select>
       <label>自定义模型名（本地模型必填，留空则用上方所选）</label>
       <input id="modelCustom" type="text" placeholder="例如 qwen2.5:7b / llama3.1:8b / deepseek-r1:7b">
-      <label>Pixabay Key（真实高清视频，推荐·免费）</label>
-      <input id="pixabayKey" type="text" placeholder="去 pixabay.com/api/docs/ 免费申请；留空则用离线动态背景">
-      <label>Pexels Key（备选素材源，可留空）</label>
-      <input id="pexelsKey" type="text" placeholder="去 pexels.com/api 免费申请；被暂停可改用上面的 Pixabay">
-      <div class="hint">填了 <b>Pixabay 或 Pexels</b> 任一 Key：每句文案会去拉<b>真实高清视频</b>做背景（最像抖音短剧）。两者都填时优先 Pexels、失败自动切 Pixabay。都不填也能用——自动用 <b>AI 免费生成真实场景图</b>作背景（无 Key、免申请）。</div>
-      <label class="chk"><input type="checkbox" id="aiImage" checked> AI 场景图背景（无 Key · 免申请）</label>
-      <div class="hint">不填 Pixabay/Pexels 时，每句文案用 AI 免费生成一张电影感实拍风画面作背景，无需任何 Key。关掉则退回纯文字卡。需要联网。</div>
-      <label class="chk"><input type="checkbox" id="shuohao" checked> 🎬 专业分镜增强（shuohao 短剧工艺）</label>
-      <div class="hint">内置开源 <b>shuohao-skills</b> 短剧工艺：让 AI 写出带冷开场钩子 / 语气分镜的文案，并生成<b>电影感、空景禁人</b>的场景图、按景别(大景/中景/近景)做运镜。关掉则退回普通口播模式。Licensed Apache-2.0（eternityspring）。</div>
       <div class="row">
         <button class="sec" onclick="saveConfig()">保存配置</button>
-        <button class="ghost" onclick="testModel()">🔌 测试是否可用</button>
-        <button class="ghost" onclick="ffDiagnose()">🩺 视频引擎自检</button>
+        <button class="ghost" onclick="testModel()">🔌 测试</button>
+        <button class="ghost" onclick="ffDiagnose()">🩺 引擎自检</button>
       </div>
       <div id="testResult" class="hint"></div>
       <div id="ffResult" class="hint"></div>
-      <div class="hint">只需一个大模型 Key。选好模型后 Base URL 会自动填好；点「测试」用你的 Key 实测能否调通。若生成视频时报 ffmpeg 错误，点「视频引擎自检」把结果发我即可精准定位。</div>
     </div>
-  </div>
 
-  <div class="card">
-    <h2>② 免费模型市场 <span class="badge done">一键选用</span></h2>
-    <div class="sub">绿标 = 免费/免费额度；点「选用」自动填好接口地址与模型名，再去官网领 Key 即可。免费额度用完/过期可能转计费，可用「测试」按钮实测。</div>
-    <div id="market"></div>
-  </div>
+    <div class="card">
+      <h2>出图引擎（决定画面）</h2>
+      <label>出图引擎</label>
+      <select id="engine">
+        <option value="modelscope">魔搭 Z-Image-Turbo（国内直连·免费·能出人物）</option>
+        <option value="pollinations">Pollinations（免 Token·国内可能不稳）</option>
+        <option value="auto">自动（有 Token 用魔搭，否则 Pollinations）</option>
+      </select>
+      <label>魔搭 Token（modelscope.cn 免费领，提升出图稳定性）</label>
+      <input id="msToken" type="text" placeholder="去 modelscope.cn → 头像 → 访问令牌 复制">
+      <div class="hint">填了 Token：每句文案用魔搭生成<b>真实场景图（有人物）</b>，国内直连、每天免费 2000 次。留空也能用，但会退回 Pollinations（国内可能被墙）。</div>
+      <label>Pixabay Key（真实视频素材，推荐·免费）</label>
+      <input id="pixabayKey" type="text" placeholder="pixabay.com/api/docs 免费申请；留空则用 AI 场景图">
+      <label>Pexels Key（备选素材源，可留空）</label>
+      <input id="pexelsKey" type="text" placeholder="pexels.com/api 免费申请">
+      <label class="chk"><input type="checkbox" id="aiImage" checked> AI 场景图背景（无 Key · 免申请）</label>
+      <label class="chk"><input type="checkbox" id="shuohao" checked> 🎬 专业分镜增强（shuohao 短剧工艺）</label>
+    </div>
 
-  <div class="card">
-    <h2>③ 生成</h2>
-    <label>视频主题 / 关键词</label>
-    <input id="subject" type="text" placeholder="例如：春天的花海，治愈系短视频">
-    <div class="row">
-      <input id="wordCount" type="number" min="50" max="2000" step="50" placeholder="字数(留空随机，如300)" style="flex:1;min-width:0">
-      <button class="ghost" onclick="genScript()">AI 生成文案</button>
+    <div class="card">
+      <h2>免费模型市场 <span class="badge done">一键选用</span></h2>
+      <div class="sub">绿标 = 免费/免费额度；点「选用」自动填好接口与模型名，再去官网领 Key。</div>
+      <div id="market"></div>
     </div>
-    <div class="hint" style="margin:8px 0 2px">🎙 已有录音？上传音频自动转文字并生成视频（需配置大模型 Key / Whisper）：</div>
-    <div class="row">
-      <input id="voiceFile" type="file" accept="audio/*" style="flex:1;min-width:0">
-      <button class="ghost" onclick="transcribeAudio()">🎙 转写并填入</button>
-    </div>
-    <label>文案（可手动修改）</label>
-    <textarea id="script" placeholder="在此填写或自动生成视频文案..."></textarea>
-    <div class="row">
-      <div>
-        <label>配音语言</label>
-        <select id="voice">
-          <optgroup label="女声（17）">
-            <option value="zh-CN-XiaoxiaoNeural||chat" selected>晓晓·聊天(女)</option>
-            <option value="zh-CN-XiaoxiaoNeural||cheerful">晓晓·活泼(女)</option>
-            <option value="zh-CN-XiaoxiaoNeural||calm">晓晓·沉稳(女)</option>
-            <option value="zh-CN-XiaoxiaoNeural||serious">晓晓·严肃(女)</option>
-            <option value="zh-CN-XiaoxiaoNeural||affectionate">晓晓·亲切(女)</option>
-            <option value="zh-CN-XiaoxiaoNeural||gentle">晓晓·温柔(女)</option>
-            <option value="zh-CN-XiaoxiaoNeural||sad">晓晓·忧伤(女)</option>
-            <option value="zh-CN-XiaoxiaoNeural||angry">晓晓·激动(女)</option>
-            <option value="zh-CN-XiaoxiaoNeural||newscast">晓晓·新闻(女)</option>
-            <option value="zh-CN-XiaoxiaoNeural||sports">晓晓·体育(女)</option>
-            <option value="zh-CN-XiaoyiNeural">一伊(女)</option>
-            <option value="zh-TW-HsiaoChenNeural">晓臻(台湾·女)</option>
-            <option value="zh-TW-HsiaoYuNeural">晓雨(台湾·女)</option>
-            <option value="zh-HK-HiuGaaiNeural">晓佳(粤语·女)</option>
-            <option value="zh-HK-HiuMaanNeural">晓曼(粤语·女)</option>
-            <option value="zh-CN-liaoning-XiaobeiNeural">晓北(东北话·女)</option>
-            <option value="zh-CN-shaanxi-XiaoniNeural">晓妮(陕西话·女)</option>
-          </optgroup>
-          <optgroup label="男声（13）">
-            <option value="zh-CN-YunxiNeural||chat">云希·聊天(男)</option>
-            <option value="zh-CN-YunxiNeural||cheerful">云希·活泼(男)</option>
-            <option value="zh-CN-YunxiNeural||calm">云希·沉稳(男)</option>
-            <option value="zh-CN-YunxiNeural||serious">云希·严肃(男)</option>
-            <option value="zh-CN-YunxiNeural||gentle">云希·温柔(男)</option>
-            <option value="zh-CN-YunxiNeural||sad">云希·忧伤(男)</option>
-            <option value="zh-CN-YunxiNeural||angry">云希·激动(男)</option>
-            <option value="zh-CN-YunxiNeural||sports">云希·体育(男)</option>
-            <option value="zh-CN-YunyangNeural">云扬(新闻·男)</option>
-            <option value="zh-CN-YunjianNeural">云健(男)</option>
-            <option value="zh-CN-YunxiaNeural">云夏(男)</option>
-            <option value="zh-TW-YunJheNeural">云哲(台湾·男)</option>
-            <option value="zh-HK-WanLungNeural">云龙(粤语·男)</option>
-          </optgroup>
-        </select>
-      </div>
-      <div>
-        <label>画面比例</label>
-        <select id="aspect">
-          <option value="9:16">竖屏 9:16</option>
-          <option value="16:9">横屏 16:9</option>
-          <option value="1:1">方形 1:1</option>
-        </select>
-      </div>
-      <div>
-        <label>视频时长（分钟）</label>
-        <select id="durationMin">
-          <option value="0">自动</option>
-          <option value="1">1</option>
-          <option value="2">2</option>
-          <option value="3">3</option>
-          <option value="4">4</option>
-          <option value="5">5</option>
-          <option value="6">6</option>
-          <option value="7">7</option>
-          <option value="8">8</option>
-          <option value="9">9</option>
-          <option value="10">10</option>
-        </select>
-      </div>
-    </div>
-    <div class="row">
-      <div>
-        <label>画质（清晰度）</label>
-        <select id="quality">
-          <option value="hd" selected>高清优先（推荐·近抖音）</option>
-          <option value="fast">极速生成（弱机/求快）</option>
-        </select>
-      </div>
-    </div>
-    <div class="hint" style="margin:6px 0 10px">时长选「自动」按配音自然长度；选 1~10 分钟会把视频拉伸/循环到指定长度（上限 10 分钟）。成片自动存到手机 <b>Download/Ai视频</b>（.mp4）。</div>
-    <button onclick="genVideo()">▶ 生成视频</button>
-  </div>
+  </section>
 
-  <div class="card">
-    <h2>④ 状态 <span id="stateBadge" class="badge"></span></h2>
-    <div id="progressBox" style="display:none">
-      <div id="progressText" class="hint">进度：0%</div>
+  <!-- ❓ 帮助 -->
+  <section class="tabpanel help" id="tab-help">
+    <div class="card">
+      <h2>❓ 帮助 / 排障</h2>
+      <h3>为什么之前是「黑屏 / 没画面」？</h3>
+      <p>旧版默认用 <span class="hl">image.pollinations.ai</span> 出图，它在<b>国行网络常被墙/超时</b>，失败后退回近黑色的文字卡，看着就像黑屏。新版默认改用 <span class="hl">魔搭 Z-Image-Turbo</span>：<b>国内直连、免费 2000 次/天、能出人物</b>，去 modelscope.cn 领个 Token 填到「配置」页即可。</p>
+      <h3>为什么之前「配音念代码」？</h3>
+      <p>旧版零 Key 时用超长提示词压免费文本模型，模型直接返回代码/乱码被念出来。新版<b>简化提示词</b>并对配音文本做「净文本」清洗（去代码块/JSON/链接），保证念的是人话。</p>
+      <h3>为什么之前「画面没人」？</h3>
+      <p>旧版 shuohao 工艺强制「空景禁人」（那是给「先出空背景、再单独合成角色」用的）。本 App 不合成角色，所以新版已<b>允许并鼓励画面出现人物</b>。</p>
+      <h3>正确出片流程</h3>
+      <div class="box">
+        1️⃣ <span class="hl">配置</span>：填大模型 Key（或本地模型），建议再填魔搭 Token<br>
+        2️⃣ <span class="hl">生成</span>：填主题 → 点「AI 生成文案」→ 点「生成视频」<br>
+        3️⃣ 等进度跑完，到 <span class="hl">作品</span> 页看片 / 下载（自动存到 Download/Ai视频）
+      </div>
+      <h3>没有大模型 Key 能用吗？</h3>
+      <p>能。零 Key 时文案走免费接口、配音用设备本地 edge-tts、画面用魔搭/Pollinations 免费出图。只是文案质量略弱，建议配一个免费 Key。</p>
+      <div class="hint">若生成报 ffmpeg 错误，回「配置」页点「🩺 引擎自检」把结果发我即可定位。</div>
     </div>
-    <div id="result"></div>
-    <div id="log" class="log"></div>
-  </div>
+  </section>
+</div>
+
+<div class="tabbar">
+  <button class="active" data-tab="gen" onclick="switchTab('gen')"><span class="ic">🎬</span>生成</button>
+  <button data-tab="works" onclick="switchTab('works')"><span class="ic">🎞</span>作品</button>
+  <button data-tab="cfg" onclick="switchTab('cfg')"><span class="ic">⚙️</span>配置</button>
+  <button data-tab="help" onclick="switchTab('help')"><span class="ic">❓</span>帮助</button>
 </div>
 
 <script>
 const API="";
 let PROVIDER_MAP={};
-function log(m){const e=document.getElementById('log');e.textContent+=m+"\n";e.scrollTop=e.scrollHeight;}
-function toggleCfg(){const b=document.querySelector('#cfgCard .body');b.style.display=b.style.display==='none'?'block':'none';}
-function setBadge(text,cls){const b=document.getElementById('stateBadge');b.className='badge '+(cls||'');b.textContent=text;}
+function log(m){const e=document.getElementById('log');if(!e)return;e.textContent+=m+"\n";e.scrollTop=e.scrollHeight;}
+function setBadge(text,cls){const b=document.getElementById('stateBadge');if(!b)return;b.className='badge '+(cls||'');b.textContent=text;}
+
+function switchTab(name){
+  document.querySelectorAll('.tabpanel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  document.querySelectorAll('.tabbar button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+  if(name==='works') loadHistory();
+  window.scrollTo({top:0});
+}
 
 async function loadProviders(){
   try{
@@ -1597,12 +1914,10 @@ async function loadProviders(){
     }
     onProviderChange();
     renderMarket(providers);
-    // 启动即回填上次保存的配置（Key/URL/模型），实现「只填一次」
     loadSavedConfig();
   }catch(e){console.error(e);}
 }
 
-// 读取已保存配置并回填到表单；若保存的 provider/model 不在下拉里则临时补一个选项
 async function loadSavedConfig(){
   try{
     const r=await fetch(API+"/api/v1/mpt_config");
@@ -1615,11 +1930,13 @@ async function loadSavedConfig(){
       }
       prov.value=c.provider;
     }
-    onProviderChange(); // 重建模型列表 + 设默认 Base URL
+    onProviderChange();
     if(c.base_url) document.getElementById('baseUrl').value=c.base_url;
     if(c.api_key) document.getElementById('apiKey').value=c.api_key;
     if(c.pexels_api_key) document.getElementById('pexelsKey').value=c.pexels_api_key;
     if(c.pixabay_api_key) document.getElementById('pixabayKey').value=c.pixabay_api_key;
+    if(c.modelscope_token!==undefined) document.getElementById('msToken').value=c.modelscope_token;
+    if(c.image_engine) document.getElementById('engine').value=c.image_engine;
     if(c.ai_image) document.getElementById('aiImage').checked=(c.ai_image!=='off');
     if(c.shuohao!==undefined) document.getElementById('shuohao').checked=(c.shuohao!=='off');
     if(c.model_name){
@@ -1647,7 +1964,7 @@ function onProviderChange(){
   }
   const hint=document.getElementById('keyHint');
   if(key==='local'||key==='custom'){
-    hint.innerHTML='本地/自建模型通常<b>无需 API Key</b>，可留空。Base URL 改成你电脑或服务器的地址：Ollama 用 <code>http://内网IP:11434/v1</code>，LM Studio 用 <code>http://内网IP:1234/v1</code>；手机与电脑需在同一 WiFi，模型名填你本地已加载的模型（如 qwen2.5:7b）。';
+    hint.innerHTML='本地/自建模型通常<b>无需 API Key</b>。Base URL 改成你电脑地址：Ollama 用 <code>http://内网IP:11434/v1</code>，LM Studio 用 <code>http://内网IP:1234/v1</code>；手机与电脑需同一 WiFi。';
   }else{
     hint.innerHTML='官网领 Key：<a class="dl" href="'+p.key_url+'" target="_blank">'+p.key_url+'</a>（'+p.region+'）';
   }
@@ -1660,11 +1977,15 @@ function renderMarket(providers){
     html+='<div class="mkt-group"><div class="mkt-title">'+p.name+' <span class="badge">'+p.region+'</span> <a class="dl" href="'+p.key_url+'" target="_blank">领 Key ↗</a></div>';
     for(const m of p.models){
       const free=m.free?'<span class="badge done">免费</span>':'<span class="badge warn">计费</span>';
-      html+='<div class="mkt-item">'+free+'<span class="mname">'+m.name+'</span><button class="ghost sm" onclick="useModel(\''+p.key+'\',\''+m.id+'\')">选用</button></div>';
+      html+='<div class="mkt-item">'+free+'<span class="mname">'+m.name+'</span><button class="ghost sm" data-pkey="'+p.key+'" data-mid="'+m.id+'">选用</button></div>';
     }
     html+='</div>';
   }
   box.innerHTML=html;
+  box.onclick=function(e){
+    const b=e.target.closest('button[data-pkey]');
+    if(b) useModel(b.dataset.pkey,b.dataset.mid);
+  };
 }
 
 function useModel(pkey,mid){
@@ -1673,8 +1994,7 @@ function useModel(pkey,mid){
   onProviderChange();
   const msel=document.getElementById('modelName');
   if(msel.querySelector('option[value="'+mid+'"]')) msel.value=mid;
-  document.querySelector('#cfgCard .body').style.display='block';
-  window.scrollTo({top:0,behavior:'smooth'});
+  switchTab('cfg');
   alert('已填入：'+pkey+' / '+mid+'。Base URL 已自动填好，去上方链接领 Key 后点「保存配置」即可。');
 }
 
@@ -1687,6 +2007,8 @@ async function saveConfig(){
     model_name:custom||document.getElementById('modelName').value.trim(),
     pexels_api_key:document.getElementById('pexelsKey').value.trim(),
     pixabay_api_key:document.getElementById('pixabayKey').value.trim(),
+    modelscope_token:document.getElementById('msToken').value.trim(),
+    image_engine:document.getElementById('engine').value,
     ai_image:(document.getElementById('aiImage').checked?'on':'off'),
     shuohao:(document.getElementById('shuohao').checked?'on':'off')
   };
@@ -1718,7 +2040,6 @@ async function testModel(){
   }catch(e){res.textContent='请求失败：'+e.message;}
 }
 
-// 视频引擎自检：把 ffmpeg 路径/版本/编码器 + 真实测试编码结果显示出来
 async function ffDiagnose(){
   const res=document.getElementById('ffResult');
   res.textContent='正在自检（首次约 10~20 秒）...';
@@ -1729,7 +2050,6 @@ async function ffDiagnose(){
     const lines=[];
     lines.push('引擎：'+(d.version||'未识别'));
     lines.push('编码器：'+(d.encoder||'未识别'));
-    lines.push('路径：'+(d.path||''));
     lines.push((d.ok?'✅ 测试编码通过：':'❌ 测试编码失败：')+(d.detail||''));
     res.innerHTML=lines.join('<br>');
     if(!d.ok){alert('视频引擎自检失败：\n'+(d.detail||'未知原因'));}
@@ -1740,7 +2060,7 @@ async function genScript(){
   const subject=document.getElementById('subject').value.trim();
   if(!subject){alert('请先填写主题');return;}
   const wc=document.getElementById('wordCount').value.trim();
-  log('正在生成文案（含素材关键词）...');
+  log('正在生成文案...');
   try{
     const r=await fetch(API+"/api/v1/plan",{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({video_subject:subject, word_count:wc})});
@@ -1748,7 +2068,7 @@ async function genScript(){
     if(j && j.data && j.data.script){
       window.curPlan=j.data;
       document.getElementById('script').value=j.data.script;
-      log('文案已生成 ✅（'+((j.data.segments||[]).length)+' 句，已配素材关键词）');
+      log('文案已生成 ✅（'+((j.data.segments||[]).length)+' 句）');
     }else{
       log('生成失败：'+(j.message||JSON.stringify(j)));
       alert('文案生成失败：'+(j.message||''));
@@ -1766,7 +2086,7 @@ async function transcribeAudio(){
     const j=await resp.json();
     if(j&&j.data&&j.data.text){
       document.getElementById('script').value=j.data.text;
-      log('转写完成 ✅，已填入文案（共 '+j.data.text.length+' 字）。点「生成视频」即可。');
+      log('转写完成 ✅，已填入文案。点「生成视频」即可。');
       alert('转写完成，已填入文案！');
     }else{
       log('转写失败：'+(j.message||JSON.stringify(j)));
@@ -1784,7 +2104,6 @@ async function genVideo(){
   document.getElementById('progressBox').style.display='block';
   setBadge('', '');
   log('正在创建视频任务...');
-  // 若未改文案，则带上结构化简案（含素材关键词），让 Pexels 真实素材生效
   let segments=null;
   if(window.curPlan && window.curPlan.script===script && window.curPlan.segments){
     segments=window.curPlan.segments;
@@ -1840,15 +2159,36 @@ function showResult(videos, downloadPath){
           '<a class="dl" href="'+url+'" download>⬇ 下载视频</a><br>';
   });
   if(downloadPath){
-    html+='<div class="hint" style="margin-top:8px;color:var(--ok)">✅ 已保存到手机：Download/Ai视频/'+downloadPath.split('/').pop()+'<br><span style="color:var(--muted)">（用手机「文件管理」App 即可找到）</span></div>';
+    html+='<div class="hint" style="margin-top:8px;color:var(--ok)">✅ 已保存到手机：Download/Ai视频/'+downloadPath.split('/').pop()+'</div>';
   }else{
-    html+='<div class="hint" style="margin-top:8px;color:var(--warn)">未导出到 Download（可能未授予存储权限）。可在应用内下载，或到系统设置开启「所有文件访问」后重生成。</div>';
+    html+='<div class="hint" style="margin-top:8px;color:var(--warn)">未导出到 Download（可能未授予存储权限）。可在应用内下载。</div>';
   }
   box.innerHTML=html;
 }
 
+async function loadHistory(){
+  const box=document.getElementById('worksList');
+  box.innerHTML='<div class="hint">加载中...</div>';
+  try{
+    const r=await fetch(API+"/api/v1/history");
+    const j=await r.json();
+    const list=(j.data&&j.data.videos)||[];
+    if(!list.length){box.innerHTML='<div class="hint">还没有作品。去「生成」页做第一个视频吧！</div>';return;}
+    let html='';
+    for(const v of list){
+      const url=API+v.url;
+      html+='<div class="work">'+
+        '<video src="'+url+'" controls></video>'+
+        '<div class="info"><div class="t">'+(v.subject||v.task_id)+'</div>'+
+        '<div class="meta">'+(v.created||'')+(v.size?(' · '+Math.round(v.size/1048576*10)/10+'MB'):'')+'</div>'+
+        '<a class="dl" href="'+url+'" download>⬇ 下载</a></div></div>';
+    }
+    box.innerHTML=html;
+  }catch(e){box.innerHTML='<div class="hint">加载失败：'+e.message+'</div>';}
+}
+
 window.addEventListener('DOMContentLoaded', loadProviders);
-log('界面已加载，请先完成「配置」再生成。');
+log('界面已加载，请先到「配置」填好大模型 Key，再到「生成」做视频。');
 </script>
 </body>
 </html>"""
@@ -1919,6 +2259,9 @@ class Handler(BaseHTTPRequestHandler):
                     "path": ffmpeg_bin(), "version": "", "encoder": "",
                     "ok": False, "detail": str(e),
                 }})
+        elif path == "/api/v1/history":
+            # 作品库：扫描本地已生成的成片，供「作品」页展示与回看
+            self._send_json({"status": 200, "data": {"videos": list_history()}})
         elif path.startswith("/api/v1/tasks/"):
             self._handle_task_get(path.split("/")[-1])
         elif path.startswith("/tasks/"):
@@ -1952,6 +2295,9 @@ class Handler(BaseHTTPRequestHandler):
             cfg["pixabay_api_key"] = (body.get("pixabay_api_key") or "").strip()
             cfg["ai_image"] = (body.get("ai_image") or "on")
             cfg["shuohao"] = (body.get("shuohao") or "on")
+            cfg["modelscope_token"] = (body.get("modelscope_token") or "").strip()
+            cfg["image_engine"] = (body.get("image_engine") or "modelscope").strip() or "modelscope"
+            cfg["tts_voice"] = (body.get("tts_voice") or "").strip() or cfg.get("tts_voice") or "zh-CN-XiaoxiaoNeural||chat"
             save_config(cfg)
             self._send_json({"status": 200, "message": "saved"})
 

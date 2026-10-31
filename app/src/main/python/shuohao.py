@@ -87,10 +87,9 @@ _MOOD_LIGHTING = {
 # 氛围 → 表面处理档（clean/bright 用 B，其余默认 A 更有电影质感）
 _WELL_KEPT_MOODS = {"warm", "hopeful", "clean", "modern", "calm", "romantic"}
 
-# 统一负向（不要出现在画面里）
-_NEGATIVE = ("no people, no human figures, no crowds, no text, no watermark, "
-             "no oversaturated colours, no warped perspective, no melted geometry, "
-             "no floating objects, no cartoon, no illustration")
+# 统一负向（画质类——本 App 不另行合成角色，画面需要有人/主体，故不再禁人）
+_NEGATIVE = ("文字水印, 低质量, 模糊, 变形, 多余手指, 畸变透视, 漂浮物体, "
+             "卡通, 插画, 油画, 3d 渲染, 过饱和色彩, 拼接痕迹")
 
 
 def _lighting_for(mood):
@@ -98,25 +97,29 @@ def _lighting_for(mood):
 
 
 def visual_prompt_for(seg, style_anchor=""):
-    """由简案的一句 segment 生成电影感、空景、禁人的英文场景图提示词。
+    """由简案的一句 segment 生成电影感、可含人物/主体的中文场景图提示词。
 
     优先用模型给的 visual_prompt；缺失则用 keyword/action/text 兜底。
-    统一追加：空景禁人 + 表面处理 + 光照 + 一致性锚点 + 画风后缀 + 负向。
+    统一追加：表面处理 + 光照 + 一致性锚点 + 画质负向。
+
+    说明：原 shuohao 工艺要求「空景禁人」，那是给「先出空背景、再单独合成角色」
+    的工作流用的。本 App 不另行合成角色，每一句直接生成一张含主体/人物的实拍风
+    画面，所以这里**允许并鼓励画面中出现人物与主体**，只保留画质类负向。
     """
     seg = seg or {}
     base = (seg.get("visual_prompt") or "").strip()
     if not base:
         base = (seg.get("keyword") or seg.get("action") or seg.get("text") or "scenery").strip()
-    # 清理：移除可能混进来的中文标点与多余引号
     mood = (seg.get("mood") or "").strip()
     surface = _SURFACE_KEPT if mood.lower() in _WELL_KEPT_MOODS else _SURFACE_WEATHERED
     lighting = _lighting_for(mood)
     anchor = (style_anchor or "").strip()
 
-    parts = [base, "empty scene, no people, no human figures", surface, lighting]
+    # 中文为主（魔搭 Z-Image-Turbo 中文原生理解最佳），并附英文画质词兼顾 Flux
+    parts = [base, "电影感镜头, 真实摄影, 4k, 浅景深, 自然光", surface, lighting]
     if anchor:
         parts.append(anchor)
-    parts.append("cinematic film still, photorealistic, 4k, professional photography, depth of field")
+    parts.append("人物与场景协调构图")
     parts.append(_NEGATIVE)
     return ", ".join(parts)
 

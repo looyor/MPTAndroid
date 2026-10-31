@@ -21,10 +21,11 @@
 
 ## 二、画面 / 美术（art）—— 决定画面质量，最重要
 
-7. **场景图提示词永远用英文，永远空景、禁人**：写明 `empty scene, no people`，
-   绝不出现角色名 / 作品名（图像模型会把它认识的东西画进去）。
+7. **场景图提示词可用中文，画面允许并鼓励出现人物/主体**：本 App 每句直接生成一张
+   含主体（人物或物件）的实拍风画面，不做「空背景 + 单独合成角色」，所以**不要写
+   `空景/禁人/no people`**。明确写出本句的主体（谁、在何处、做什么），让画面有人有戏。
 8. **不写渲染风格词**（不要 `cinematic`/`painterly`/`3d render` 这类画风描述塞进每句），
-   **只写「这个空间此刻的状态」**；画风由出图阶段统一附加。
+   **只写「这个空间此刻的状态与主体」**；画风由出图阶段统一附加。
 9. **表面处理二选一**（按这个空间实际保养水平选，不是两种画风，是两种事实）：
    - A 日常使用：`weathered, lived-in materials: chipped paint, water stains, patina on metal, worn wood grain, dust in corners and light shafts`
    - B 持续维护：`well-kept, actively maintained materials: sound lacquer with even sheen, swept stone and timber, polished metal fittings, no peeling paint`
@@ -32,8 +33,8 @@
     不要写「白天/夜晚」全家桶，按本句内容挑一个。
 11. **一致性锚点（style_anchor）**：整段视频共用一个视觉锚点（例如「同一家深夜便利店」
     「同一片雾中江面」「同一间老式办公室」），让每一帧都像同一个世界。
-12. **统一负向（不要出现在画面里）**：`people, human figures, crowds, text, watermark,
-    oversaturated colours, warped perspective, melted geometry, floating objects`。
+12. **统一负向（只限画质，不禁人）**：`文字水印, 低质量, 模糊, 变形, 多余手指,
+    畸变透视, 漂浮物体, 卡通, 插画, 油画, 3d 渲染, 过饱和色彩`。
 
 ## 三、分镜 / 镜头（storyboard）—— 决定「像不像专业视频」
 
@@ -49,8 +50,8 @@
 
 除原有 `script` 与 `segments[].text / keyword` 外，请为每句补充：
 
-- `visual_prompt`：英文电影感场景图提示词（空景禁人 + 表面处理 + 光照 + 本句内容），
-  不要含角色名、不要含渲染风格词、不要含文字。
+- `visual_prompt`：中文电影感场景图提示词（主体/人物 + 表面处理 + 光照 + 本句内容），
+  明确写出本句主体（谁/在何处/做什么），不要含渲染风格词、不要含文字、不要写「禁人/空景」。
 - `shot`：`wide` / `medium` / `close` 三选一。
 - `mood`：本句氛围，如 `tense` / `warm` / `calm` / `gloomy` / `hopeful` / `urgent`。
 - `delivery`：本句语气/情绪，如 `平静` / `紧张` / `激昂` / `温柔` / `忧伤` / `严肃` / `愤怒`。
